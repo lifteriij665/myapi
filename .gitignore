@@ -1,0 +1,10 @@
+node_modules/
+data/
+browser-profiles/
+.env
+.env.local
+*.log
+npm-debug.log*
+freebuff_credentials.json
+.DS_Store
+Thumbs.db

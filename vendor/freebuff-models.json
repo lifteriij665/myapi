@@ -1,0 +1,91 @@
+{
+  "generatedAt": "2026-08-11T00:01:42.299Z",
+  "source": "CodebuffAI/freebuff main",
+  "models": [
+    {
+      "id": "mimo/mimo-v2.5",
+      "session": "mimo/mimo-v2.5",
+      "agent": "base2-free-mimo",
+      "upstream": "mimo/mimo-v2.5"
+    },
+    {
+      "id": "minimax/minimax-m3",
+      "session": "minimax/minimax-m3",
+      "agent": "base2-free-minimax-m3",
+      "upstream": "minimax/minimax-m3"
+    },
+    {
+      "id": "openai/gpt-5.6-luna",
+      "session": "openai/gpt-5.6-luna",
+      "agent": "base2-free-luna",
+      "upstream": "openai/gpt-5.6-luna"
+    },
+    {
+      "id": "deepseek/deepseek-v4-pro",
+      "session": "deepseek/deepseek-v4-pro",
+      "agent": "base2-free-deepseek",
+      "upstream": "deepseek/deepseek-v4-pro"
+    },
+    {
+      "id": "deepseek/deepseek-v4-flash",
+      "session": "deepseek/deepseek-v4-flash",
+      "agent": "base2-free-deepseek-flash",
+      "upstream": "deepseek/deepseek-v4-flash"
+    },
+    {
+      "id": "z-ai/glm-5.2",
+      "session": "z-ai/glm-5.2",
+      "agent": "base2-free-glm",
+      "upstream": "z-ai/glm-5.2"
+    },
+    {
+      "id": "poolside/laguna-s-2.1",
+      "session": "poolside/laguna-s-2.1",
+      "agent": "base2-free-laguna-s-2-1",
+      "upstream": "poolside/laguna-s-2.1"
+    },
+    {
+      "id": "openrouter/poolside/laguna-s-2.1",
+      "session": "openrouter/poolside/laguna-s-2.1",
+      "agent": "base2-free-laguna-s-2-1-openrouter",
+      "upstream": "openrouter/poolside/laguna-s-2.1"
+    },
+    {
+      "id": "crof/kimi-k3-eco",
+      "session": "crof/kimi-k3-eco",
+      "agent": "base2-free-kimi-k3-eco",
+      "upstream": "crof/kimi-k3-eco"
+    },
+    {
+      "id": "anthropic/claude-fable-5",
+      "session": "anthropic/claude-fable-5",
+      "agent": "base2-free-fable",
+      "upstream": "anthropic/claude-fable-5"
+    },
+    {
+      "id": "meta/muse-spark-1.2-contributor",
+      "session": "meta/muse-spark-1.2-contributor",
+      "agent": "base2-free-muse-spark",
+      "upstream": "meta/muse-spark-1.2-contributor"
+    }
+  ],
+  "pools": {
+    "premium": [
+      "minimax/minimax-m3",
+      "deepseek/deepseek-v4-pro",
+      "openai/gpt-5.6-luna",
+      "poolside/laguna-s-2.1",
+      "openrouter/poolside/laguna-s-2.1",
+      "crof/kimi-k3-eco",
+      "meta/muse-spark-1.2-contributor"
+    ],
+    "glm": [
+      "z-ai/glm-5.2"
+    ],
+    "standard": [
+      "mimo/mimo-v2.5",
+      "deepseek/deepseek-v4-flash",
+      "anthropic/claude-fable-5"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+data
+browser-profiles
+.env
+.env.local
+*.log
+_orig

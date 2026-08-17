@@ -1,0 +1,5 @@
+# 仓库里统一用 LF：docker-entrypoint.sh 带 CRLF 会让容器里的 sh 直接报
+# "bad interpreter: /usr/bin/env sh^M"，所以这里显式钉死行尾
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf

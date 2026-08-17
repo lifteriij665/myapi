@@ -1,0 +1,21 @@
+{
+  "name": "myapi",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "freebuff2api for Railway: password-locked web console, in-browser account login (device code / server-side patchright chromium), multi-account pool, free/paid model gating, OpenAI + Anthropic compatible API",
+  "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "update-worker": "node scripts/update-worker.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "dependencies": {
+    "patchright": "1.61.1",
+    "ws": "8.21.3"
+  }
+}

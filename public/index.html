@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>myapi 控制台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffb648'/%3E%3Ctext x='16' y='22' font-size='16' text-anchor='middle' font-family='monospace' fill='%23231808'%3Efb%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ============ 锁屏 ============ -->
+<section id="lock">
+  <form class="lock-card" id="lock-form" autocomplete="off">
+    <h1>myapi 控制台</h1>
+    <p class="sub">freebuff 号池 · OpenAI 兼容网关</p>
+    <label class="field">
+      <span class="lbl">管理员密码</span>
+      <input type="password" id="lock-pass" placeholder="输入 ADMIN_PASSWORD" autocomplete="current-password" required>
+    </label>
+    <button class="primary wide" type="submit" id="lock-btn">解锁</button>
+    <p class="hint" id="lock-hint">密码来自环境变量 ADMIN_PASSWORD；没设置的话，首次启动会在部署日志里打印一个随机密码。</p>
+  </form>
+</section>
+
+<!-- ============ 主界面 ============ -->
+<main id="app" class="hidden">
+  <header class="top">
+    <div class="brand"><span class="dot"></span><b>myapi</b><span class="note" id="ver"></span></div>
+    <div class="spacer"></div>
+    <span class="badge" id="storage-badge"></span>
+    <span class="badge" id="health-badge"></span>
+    <button class="ghost mini" id="btn-refresh">刷新</button>
+    <button class="ghost mini" id="btn-logout">退出</button>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <!-- 接入信息 -->
+  <section class="card">
+    <h2>接入信息 <span class="count">复制到任意 OpenAI 客户端即可用</span></h2>
+    <div class="card-body">
+      <div class="kv"><span class="k">Base URL</span><span class="v" id="v-base"></span><button class="mini" data-copy="#v-base">复制</button></div>
+      <div class="kv"><span class="k">API Key</span><span class="v" id="v-key"></span><button class="mini" data-copy="#v-key">复制</button></div>
+      <div class="kv"><span class="k">Anthropic</span><span class="v" id="v-anthropic"></span><button class="mini" data-copy="#v-anthropic">复制</button></div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btn-copy-all">一键复制完整配置</button>
+        <button id="btn-selftest">自检（真实跑一次免费模型）</button>
+        <span class="note" id="selftest-result"></span>
+      </div>
+      <p class="hint">Base URL 是按当前访问地址算出来的；绑定自定义域名后打开新域名，这里显示的就是新域名。</p>
+    </div>
+  </section>
+
+  <!-- 账号池 -->
+  <section class="card">
+    <h2>账号池 <span class="count" id="acct-count"></span>
+      <span class="spacer"></span>
+      <button class="mini" id="btn-check-all">全部检测</button>
+      <button class="primary mini" id="btn-add-account">+ 添加账号</button>
+    </h2>
+    <div class="card-body tight">
+      <table id="acct-table">
+        <thead><tr><th>账号</th><th>用途</th><th>状态</th><th>token</th><th>额度快照</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty hidden" id="acct-empty">还没有账号。点右上角「+ 添加账号」，可以直接在网页里完成登录。</div>
+    </div>
+  </section>
+
+  <div class="grid2">
+    <!-- API keys -->
+    <section class="card">
+      <h2>API Key <span class="count" id="key-count"></span>
+        <span class="spacer"></span>
+        <button class="primary mini" id="btn-add-key">+ 新建</button>
+      </h2>
+      <div class="card-body tight">
+        <table id="key-table">
+          <thead><tr><th>名称</th><th>key</th><th>付费模型</th><th>调用</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="card">
+      <h2>设置</h2>
+      <div class="card-body">
+        <label class="check" style="margin-bottom:12px">
+          <input type="checkbox" id="set-allowpaid"><span>新建 API key 时默认勾选「允许付费模型」</span>
+        </label>
+        <div class="kv"><span class="k">数据目录</span><span class="v" id="v-datadir"></span></div>
+        <div class="kv"><span class="k">内置浏览器</span><span class="v" id="v-browser"></span></div>
+        <div class="row" style="margin-top:12px">
+          <button class="mini" id="btn-export">导出备份</button>
+          <button class="mini" id="btn-import">导入备份</button>
+          <button class="mini" id="btn-passwd">修改密码</button>
+        </div>
+        <p class="hint">没挂 Volume 时导出备份特别重要：重新部署会清空账号池。</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- 模型 -->
+  <section class="card">
+    <h2>模型 <span class="count" id="model-count"></span>
+      <span class="spacer"></span>
+      <label class="check"><input type="checkbox" id="model-only-enabled"><span>只看已启用</span></label>
+      <button class="mini" id="btn-model-refresh">刷新模型表</button>
+    </h2>
+    <div class="card-body tight">
+      <table id="model-table">
+        <thead><tr><th>模型</th><th>分类</th><th>说明</th><th>对外提供</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <p class="note" style="text-align:center;margin-top:26px">
+    引擎来自 <a href="https://github.com/pingmike2/freebuff2api-wokers" target="_blank" rel="noreferrer">pingmike2/freebuff2api-wokers</a>（AGPL-3.0）· 仅供技术研究，账号封禁风险自负
+  </p>
+</main>
+
+<div class="toasts" id="toasts"></div>
+<div id="modal-root"></div>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>
