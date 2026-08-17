@@ -1,10 +1,12 @@
 node_modules/
 data/
+data-*/
 browser-profiles/
 .env
 .env.local
 *.log
 npm-debug.log*
 freebuff_credentials.json
+shot-*.png
 .DS_Store
 Thumbs.db

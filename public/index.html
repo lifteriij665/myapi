@@ -4,128 +4,223 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>myapi 控制台</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffb648'/%3E%3Ctext x='16' y='22' font-size='16' text-anchor='middle' font-family='monospace' fill='%23231808'%3Efb%3C/text%3E%3C/svg%3E">
+<meta name="color-scheme" content="dark">
+<title>myapi · 号池网关控制台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1518'/%3E%3Cpath d='M7 22V10h3.4l2.6 5 2.6-5H19v12h-3v-6.6l-2.4 4.4h-1.2L10 15.4V22H7z' fill='%234fd39a'/%3E%3Crect x='21' y='10' width='3' height='12' rx='1.5' fill='%23e8a54b'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
-<!-- ============ 锁屏 ============ -->
-<section id="lock">
-  <form class="lock-card" id="lock-form" autocomplete="off">
-    <h1>myapi 控制台</h1>
-    <p class="sub">freebuff 号池 · OpenAI 兼容网关</p>
+<!-- ══════════════ 解锁 ══════════════ -->
+<section id="gate">
+  <form class="gate-card" id="gate-form" autocomplete="off">
+    <div class="gate-top">
+      <span class="mark">M</span>
+      <div class="gate-id">
+        <b>myapi</b>
+        <small>号池网关 · 控制台</small>
+      </div>
+    </div>
+    <div class="gate-rule"></div>
     <label class="field">
       <span class="lbl">管理员密码</span>
-      <input type="password" id="lock-pass" placeholder="输入 ADMIN_PASSWORD" autocomplete="current-password" required>
+      <input type="password" id="gate-pass" autocomplete="current-password" required spellcheck="false">
     </label>
-    <button class="primary wide" type="submit" id="lock-btn">解锁</button>
-    <p class="hint" id="lock-hint">密码来自环境变量 ADMIN_PASSWORD；没设置的话，首次启动会在部署日志里打印一个随机密码。</p>
+    <button class="btn primary block" type="submit" id="gate-btn">解锁控制台</button>
+    <p class="gate-hint" id="gate-hint">密码来自环境变量 ADMIN_PASSWORD。</p>
   </form>
+  <p class="gate-ver" id="gate-ver"></p>
 </section>
 
-<!-- ============ 主界面 ============ -->
-<main id="app" class="hidden">
-  <header class="top">
-    <div class="brand"><span class="dot"></span><b>myapi</b><span class="note" id="ver"></span></div>
-    <div class="spacer"></div>
-    <span class="badge" id="storage-badge"></span>
-    <span class="badge" id="health-badge"></span>
-    <button class="ghost mini" id="btn-refresh">刷新</button>
-    <button class="ghost mini" id="btn-logout">退出</button>
-  </header>
-
-  <div id="banner" class="banner hidden"></div>
-
-  <!-- 接入信息 -->
-  <section class="card">
-    <h2>接入信息 <span class="count">复制到任意 OpenAI 客户端即可用</span></h2>
-    <div class="card-body">
-      <div class="kv"><span class="k">Base URL</span><span class="v" id="v-base"></span><button class="mini" data-copy="#v-base">复制</button></div>
-      <div class="kv"><span class="k">API Key</span><span class="v" id="v-key"></span><button class="mini" data-copy="#v-key">复制</button></div>
-      <div class="kv"><span class="k">Anthropic</span><span class="v" id="v-anthropic"></span><button class="mini" data-copy="#v-anthropic">复制</button></div>
-      <div class="row" style="margin-top:12px">
-        <button class="primary" id="btn-copy-all">一键复制完整配置</button>
-        <button id="btn-selftest">自检（真实跑一次免费模型）</button>
-        <span class="note" id="selftest-result"></span>
-      </div>
-      <p class="hint">Base URL 是按当前访问地址算出来的；绑定自定义域名后打开新域名，这里显示的就是新域名。</p>
+<!-- ══════════════ 应用 ══════════════ -->
+<div id="shell" class="hidden">
+  <aside class="rail">
+    <div class="rail-head">
+      <span class="mark">M</span>
+      <div class="gate-id"><b>myapi</b><small>号池网关</small></div>
     </div>
-  </section>
 
-  <!-- 账号池 -->
-  <section class="card">
-    <h2>账号池 <span class="count" id="acct-count"></span>
-      <span class="spacer"></span>
-      <button class="mini" id="btn-check-all">全部检测</button>
-      <button class="primary mini" id="btn-add-account">+ 添加账号</button>
-    </h2>
-    <div class="card-body tight">
-      <table id="acct-table">
-        <thead><tr><th>账号</th><th>用途</th><th>状态</th><th>token</th><th>额度快照</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <div class="empty hidden" id="acct-empty">还没有账号。点右上角「+ 添加账号」，可以直接在网页里完成登录。</div>
+    <nav class="nav" id="nav">
+      <button class="nav-item is-active" data-view="overview"><span>概览</span></button>
+      <button class="nav-item" data-view="accounts"><span>账号池</span><em id="nc-accounts">–</em></button>
+      <button class="nav-item" data-view="keys"><span>API Key</span><em id="nc-keys">–</em></button>
+      <button class="nav-item" data-view="models"><span>模型</span><em id="nc-models">–</em></button>
+      <button class="nav-item" data-view="settings"><span>设置</span></button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="mrow"><span>引擎</span><b id="m-engine">–</b></div>
+      <div class="mrow"><span>数据</span><b id="m-storage">–</b></div>
+      <div class="mrow"><span>浏览器</span><b id="m-browser">–</b></div>
     </div>
-  </section>
+  </aside>
 
-  <div class="grid2">
-    <!-- API keys -->
-    <section class="card">
-      <h2>API Key <span class="count" id="key-count"></span>
-        <span class="spacer"></span>
-        <button class="primary mini" id="btn-add-key">+ 新建</button>
-      </h2>
-      <div class="card-body tight">
-        <table id="key-table">
-          <thead><tr><th>名称</th><th>key</th><th>付费模型</th><th>调用</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
+  <main class="main">
+    <header class="topbar">
+      <h1 id="view-title">概览</h1>
+      <span class="pill" id="top-pill"><i class="lamp"></i><span>—</span></span>
+      <span class="grow"></span>
+      <span class="synced" id="synced">—</span>
+      <button class="btn quiet" id="btn-sync">刷新</button>
+      <button class="btn quiet" id="btn-logout">退出</button>
+    </header>
+
+    <div id="notice" class="notice hidden"></div>
+    <!-- ─────────── 概览 ─────────── -->
+    <section class="view" data-view="overview">
+      <div class="eyebrow"><b>号池</b><span>POOL</span>
+        <span class="eyebrow-note" id="pool-summary"></span>
       </div>
-    </section>
+      <div class="channels" id="channels"></div>
 
-    <!-- 设置 -->
-    <section class="card">
-      <h2>设置</h2>
-      <div class="card-body">
-        <label class="check" style="margin-bottom:12px">
-          <input type="checkbox" id="set-allowpaid"><span>新建 API key 时默认勾选「允许付费模型」</span>
-        </label>
-        <div class="kv"><span class="k">数据目录</span><span class="v" id="v-datadir"></span></div>
-        <div class="kv"><span class="k">内置浏览器</span><span class="v" id="v-browser"></span></div>
-        <div class="row" style="margin-top:12px">
-          <button class="mini" id="btn-export">导出备份</button>
-          <button class="mini" id="btn-import">导入备份</button>
-          <button class="mini" id="btn-passwd">修改密码</button>
+      <div class="eyebrow"><b>接入</b><span>ENDPOINT</span></div>
+      <div class="split endpoint">
+        <div class="panel">
+          <div class="wire">
+            <span class="wl">Base URL</span>
+            <code id="v-base">—</code>
+            <button class="btn tiny" data-copy="#v-base">复制</button>
+          </div>
+          <div class="wire">
+            <span class="wl">API Key</span>
+            <code id="v-key">—</code>
+            <button class="btn tiny" data-copy="#v-key">复制</button>
+          </div>
+          <div class="wire">
+            <span class="wl">Anthropic</span>
+            <code id="v-anthropic">—</code>
+            <button class="btn tiny" data-copy="#v-anthropic">复制</button>
+          </div>
+          <div class="wire-foot">
+            <span id="v-keyinfo" class="muted"></span>
+            <button class="btn" id="btn-copy-all">复制完整配置</button>
+          </div>
         </div>
-        <p class="hint">没挂 Volume 时导出备份特别重要：重新部署会清空账号池。</p>
+
+        <div class="panel">
+          <div class="panel-title">自检</div>
+          <p class="muted small">用号池真跑一次免费模型，确认从 key 到上游整条链路是通的。</p>
+          <button class="btn" id="btn-selftest">运行自检</button>
+          <div class="probe-out" id="selftest-out"></div>
+        </div>
+      </div>
+
+      <div class="eyebrow" id="steps-eyebrow"><b>上手</b><span>SETUP</span></div>
+      <ol class="steps" id="steps"></ol>
+    </section>
+
+    <!-- ─────────── 账号池 ─────────── -->
+    <section class="view hidden" data-view="accounts">
+      <div class="toolbar">
+        <p class="muted small grow">多号轮换由引擎自动完成；「用途」决定这个号接不接付费模型。</p>
+        <span class="toolbar-acts">
+          <button class="btn" id="btn-check-all">全部检测</button>
+          <button class="btn primary" id="btn-add-account">添加账号</button>
+        </span>
+      </div>
+      <div class="panel flush">
+        <div class="tablewrap">
+          <table id="acct-table">
+            <thead><tr>
+              <th>账号</th><th>用途</th><th>状态</th><th>额度快照</th><th>token</th><th class="right">操作</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="blank hidden" id="acct-blank">
+          <b>号池是空的</b>
+          <p>加一个号，网关才有东西可路由。用「授权链接」方式，几十秒就能加一个。</p>
+          <button class="btn primary" data-act="add-account">添加账号</button>
+        </div>
       </div>
     </section>
-  </div>
 
-  <!-- 模型 -->
-  <section class="card">
-    <h2>模型 <span class="count" id="model-count"></span>
-      <span class="spacer"></span>
-      <label class="check"><input type="checkbox" id="model-only-enabled"><span>只看已启用</span></label>
-      <button class="mini" id="btn-model-refresh">刷新模型表</button>
-    </h2>
-    <div class="card-body tight">
-      <table id="model-table">
-        <thead><tr><th>模型</th><th>分类</th><th>说明</th><th>对外提供</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-  </section>
+    <!-- ─────────── API Key ─────────── -->
+    <section class="view hidden" data-view="keys">
+      <div class="toolbar">
+        <p class="muted small grow">发给客户端的凭证；不开「付费模型」就只能用免费模型，不会烧 Premium 额度。</p>
+        <span class="toolbar-acts"><button class="btn primary" id="btn-add-key">新建 Key</button></span>
+      </div>
+      <div class="panel flush">
+        <div class="tablewrap">
+          <table id="key-table">
+            <thead><tr>
+              <th>名称</th><th>Key</th><th>付费模型</th><th>启用</th><th>调用</th><th>最近</th><th class="right">操作</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
 
-  <p class="note" style="text-align:center;margin-top:26px">
-    引擎来自 <a href="https://github.com/pingmike2/freebuff2api-wokers" target="_blank" rel="noreferrer">pingmike2/freebuff2api-wokers</a>（AGPL-3.0）· 仅供技术研究，账号封禁风险自负
-  </p>
-</main>
+    <!-- ─────────── 模型 ─────────── -->
+    <section class="view hidden" data-view="models">
+      <div class="toolbar">
+        <div class="seg" id="model-filter">
+          <button class="is-on" data-filter="all">全部</button>
+          <button data-filter="free">免费</button>
+          <button data-filter="paid">付费</button>
+        </div>
+        <input type="search" id="model-search" placeholder="搜模型名" class="search">
+        <span class="grow"></span>
+        <span class="muted small" id="model-meta"></span>
+        <button class="btn" id="btn-model-refresh">刷新模型表</button>
+      </div>
+      <div class="panel flush">
+        <div class="tablewrap">
+          <table id="model-table">
+            <thead><tr>
+              <th>模型</th><th>分类</th><th>额度池</th><th>说明</th><th class="right">对外提供</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────── 设置 ─────────── -->
+    <section class="view hidden" data-view="settings">
+      <div class="split">
+        <div class="panel">
+          <div class="panel-title">默认行为</div>
+          <label class="row-toggle">
+            <span>新建 Key 时默认允许付费模型</span>
+            <input type="checkbox" class="switch" id="set-allowpaid">
+          </label>
+          <p class="muted small">只影响以后新建的 Key，不改动已有的。</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">存储</div>
+          <div class="wire"><span class="wl">数据目录</span><code id="s-datadir">—</code></div>
+          <div class="wire"><span class="wl">持久性</span><code id="s-persist">—</code></div>
+          <p class="muted small" id="s-persist-note"></p>
+          <div class="btnrow">
+            <button class="btn" id="btn-export">导出备份</button>
+            <button class="btn" id="btn-import">导入备份</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">内置浏览器</div>
+          <div class="wire"><span class="wl">状态</span><code id="s-browser">—</code></div>
+          <div class="wire"><span class="wl">代理</span><code id="s-proxy">—</code></div>
+          <p class="muted small">headful（Xvfb）模式下 patchright 的指纹最接近真机；关掉内置浏览器可以省内存，加号改用授权链接。</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">访问</div>
+          <p class="muted small">拿到管理密码等于拿到号池里所有 token，别用弱密码。</p>
+          <div class="btnrow"><button class="btn" id="btn-passwd">修改管理密码</button></div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
 
 <div class="toasts" id="toasts"></div>
-<div id="modal-root"></div>
-
+<div id="dialogs"></div>
 <script src="/app.js" type="module"></script>
 </body>
 </html>

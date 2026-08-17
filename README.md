@@ -14,6 +14,24 @@
 
 > 引擎文件 `vendor/worker.js` 原样引用上游、**一行没改**，方便随时 `npm run update-worker` 升级。所有新增能力都在 `src/` 这一层。
 
+## 控制台长什么样
+
+概览：号池状态一条一条排开（灯 = 存活状态，条 = 额度用了多少），下面是可以直接复制的接入信息。
+
+![概览](docs/console-overview.png)
+
+账号池：每个号单独设「用途」，一键 0 消耗探活，额度快照直接显示。
+
+![账号池](docs/console-accounts.png)
+
+内置浏览器登录：服务器上的 Chromium 画面推到网页里，鼠标键盘都转发过去，在这儿点「Continue with Google」就能把号加进池子。
+
+![内置浏览器](docs/console-browser-login.png)
+
+模型：按上游额度池自动分成免费 / 付费，可以手动改分类、也可以直接下架某个模型。
+
+![模型](docs/console-models.png)
+
 ---
 
 ## 一、部署到 Railway
