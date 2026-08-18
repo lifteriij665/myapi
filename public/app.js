@@ -504,6 +504,11 @@ function renderSettings(s) {
     ? `可用 · ${s.browser.headless ? 'headless' : 'headful (Xvfb)'}`
     : `关闭 · ${s.browser.reason || s.browser.loadError || '未安装 Chromium'}`;
   $('#s-proxy').textContent = s.browser.proxy || '直连';
+  const cred = s.credentials || {};
+  const parts = [];
+  if (cred.env) parts.push('环境变量 ADMIN_PASSWORD');
+  if (cred.console) parts.push(cred.consoleGenerated ? '首次启动自动生成的临时密码（建议尽快改掉）' : '控制台里设置的密码');
+  $('#s-creds').textContent = parts.length ? `${parts.length} 种：${parts.join(' + ')}` : '（没有设置密码）';
 }
 
 // ─────────────────────────────────────────────── 概览上的动作
@@ -607,7 +612,25 @@ $('#set-active').addEventListener('change', async (ev) => {
   toast(ev.target.value ? '已指定当前账号' : '已放开指定，下一次请求自己挑');
   sync(true);
 });
-$('#btn-export').addEventListener('click', () => window.open('/admin/api/export', '_blank'));
+$('#btn-export').addEventListener('click', async () => {
+  const btn = $('#btn-export');
+  btn.disabled = true;
+  try {
+    // 走 POST：GET 的备份接口可以被恶意页面用顶层跳转触发，而这份备份里是明文 token
+    const data = await api('/export', { method: 'POST' });
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `myapi-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast('备份已下载 —— 里面是明文 token，别乱放');
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // ─────────────────────────────────────────────── 对话框
 function openDialog(title, html, { width = 560, onClose } = {}) {
@@ -656,23 +679,42 @@ $('#btn-add-key').addEventListener('click', () => {
 $('#btn-passwd').addEventListener('click', () => {
   const d = openDialog(
     '修改管理密码',
-    `<label class="field"><span class="lbl">新密码（至少 6 位）</span>
+    `<label class="field"><span class="lbl">当前密码</span>
+      <input type="password" id="pw-cur" autocomplete="current-password"></label>
+    <label class="field"><span class="lbl">新密码（至少 10 位，别用纯数字）</span>
       <input type="password" id="pw-next" autocomplete="new-password"></label>
-    <p class="muted small">改完其它设备要重新登录。环境变量 ADMIN_PASSWORD 里那个密码依然有效 —— 想只留新密码，把那个变量删掉再部署。</p>
+    <p class="muted small">保存后所有设备上的登录状态都会失效（这台会自动续上）。环境变量 ADMIN_PASSWORD 里那个密码依然有效 —— 想只留新密码，把那个变量删掉再部署。</p>
     <div class="dlg-foot"><button class="btn js-cancel" type="button">取消</button>
       <button class="btn primary" id="pw-go" type="button">保存</button></div>`,
     { width: 460 }
   );
   $('.js-cancel', d.root).addEventListener('click', d.close);
   $('#pw-go', d.root).addEventListener('click', async () => {
+    const btn = $('#pw-go', d.root);
+    btn.disabled = true;
     try {
-      await api('/password', { method: 'POST', body: { next: $('#pw-next', d.root).value } });
-      toast('密码已更新');
+      const r = await api('/password', {
+        method: 'POST',
+        body: { current: $('#pw-cur', d.root).value, next: $('#pw-next', d.root).value },
+      });
+      toast(r.note || '密码已更新');
       d.close();
     } catch (err) {
       toast(err.message, 'err');
+    } finally {
+      btn.disabled = false;
     }
   });
+});
+
+$('#btn-logout-all').addEventListener('click', async () => {
+  if (!confirm('把所有设备上的登录状态都作废？（这台浏览器会自动续上）')) return;
+  try {
+    const r = await api('/logout-all', { method: 'POST' });
+    toast(r.note || '已登出所有设备');
+  } catch (err) {
+    toast(err.message, 'err');
+  }
 });
 
 $('#btn-import').addEventListener('click', () => {

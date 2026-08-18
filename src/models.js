@@ -25,6 +25,8 @@ export function looksLikeClaude(raw) {
 }
 
 const bundled = JSON.parse(readFileSync(resolve(ROOT, 'vendor/freebuff-models.json'), 'utf8'));
+// 随包表里的 premium 名单是"地板"：远端刷新只能往上加，不能把它们放宽成免费
+const bundledPremium = new Set(bundled?.pools?.premium || []);
 
 let table = normalize(bundled, 'bundled');
 let lastRefresh = 0;
@@ -43,6 +45,19 @@ function normalize(raw, source) {
   // 池里出现但 models 里没有的 id 也补进来，保证分类查得到
   for (const id of [...premium, ...glm, ...standard]) {
     if (!models.has(id)) models.set(id, { id, agent: '', session: id });
+  }
+  // 远端表只允许把分类"收紧"：随包表里标成 premium 的，远端说是免费也不放宽。
+  // 分类数据是从第三方可变 URL（latest / @main）拉的，没有签名；
+  // 一旦那份文件被改，把 premium 说成 standard 就等于让没勾选付费的 key 去烧 Premium 额度。
+  if (source !== 'bundled') {
+    for (const id of bundledPremium) {
+      if (!premium.has(id)) {
+        premium.add(id);
+        standard.delete(id);
+        glm.delete(id);
+        if (!models.has(id)) models.set(id, { id, agent: '', session: id });
+      }
+    }
   }
   return { premium, glm, standard, models, source, generatedAt: raw?.generatedAt || null };
 }

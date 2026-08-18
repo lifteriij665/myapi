@@ -40,6 +40,41 @@ export function browserFeature() {
   };
 }
 
+/**
+ * 内置浏览器只用来开登录页，所以把目标限制成公网 http(s)。
+ * 不限制的话，这个浏览器就是一个"以容器身份发请求"的 SSRF 工具：
+ * 127.0.0.1 上的管理接口、Railway 内网、169.254.169.254 这类元数据地址都能碰到。
+ * 确实需要访问内网时设 BROWSER_ALLOW_PRIVATE=true。
+ */
+export function safeTarget(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+  let u;
+  try {
+    u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `https://${text}`);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (/^(1|true|yes|on)$/i.test(process.env.BROWSER_ALLOW_PRIVATE || '')) return u.toString();
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const blocked =
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === 'metadata' ||
+    host.endsWith('.internal') ||
+    host === '0.0.0.0' ||
+    host === '::1' ||
+    /^127\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    /^(fe80:|fc|fd)/i.test(host) ||
+    /^::ffff:(127|10|192\.168|169\.254)\./i.test(host);
+  return blocked ? null : u.toString();
+}
+
 const KEY_MAP = {
   Enter: 'Enter',
   Backspace: 'Backspace',
@@ -254,7 +289,13 @@ class BrowserSession {
 
   async navigate(url) {
     if (!this.page) return;
-    const target = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    const target = safeTarget(url);
+    if (!target) {
+      const msg = `拒绝打开 ${String(url).slice(0, 120)}：内置浏览器只允许公网 http/https 地址`;
+      console.warn(`[browser ${this.id}] ${msg}`);
+      this.broadcast({ t: 'error', message: msg });
+      return;
+    }
     await this.page.goto(target, { waitUntil: 'domcontentloaded' }).catch((err) => {
       this.broadcast({ t: 'error', message: `打开 ${target} 失败：${err.message}` });
     });
@@ -350,6 +391,15 @@ export function getSession(flowId) {
 /** 给某个登录 flow 起一个内置浏览器，并直接打开授权链接 */
 export async function startBrowserForFlow(flow, { profile = 'fresh' } = {}) {
   if (sessions.has(flow.id)) return sessions.get(flow.id);
+  if (sessions.size >= config.maxBrowserSessions) {
+    throw Object.assign(
+      new Error(
+        `已经有 ${sessions.size} 个内置浏览器在跑了（上限 ${config.maxBrowserSessions}）。` +
+          '一个 Chromium 要几百 MB，再开容器会 OOM 把 API 一起带下去。先把之前那个登录流程关掉，或者调大 MAX_BROWSER_SESSIONS。'
+      ),
+      { statusCode: 429 }
+    );
+  }
   const session = new BrowserSession({ profile });
   sessions.set(flow.id, session);
   flow.browser = {

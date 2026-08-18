@@ -17,7 +17,24 @@ import {
   looksLikeClaude,
   DEFAULT_MODEL,
 } from './models.js';
-import { readBody, randomId } from './util.js';
+import { readBody, randomId, createRateLimiter, createGate, clientIp } from './util.js';
+
+// 同时在处理的 /v1 请求数上限：每个请求都可能带几 MB body + 一条上游流
+const apiGate = createGate(config.maxInflightApi);
+// key 认证失败的按 IP 限流：不然可以无限次拿 key 去撞
+const keyFailLimiter = createRateLimiter({ windowMs: 5 * 60 * 1000, max: 30 });
+// 只往外透传这些响应头，其余（包括上游可能带的 set-cookie / access-control-*）一律丢掉
+const PASS_HEADERS = new Set([
+  'content-type',
+  'cache-control',
+  'retry-after',
+  'x-freebuff2api-version',
+  'openai-organization',
+  'openai-processing-ms',
+  'openai-version',
+  'anthropic-version',
+  'anthropic-organization-id',
+]);
 
 const ANTHROPIC_PATHS = new Set(['/v1/messages', '/messages', '/v1/messages/count_tokens', '/messages/count_tokens']);
 const COUNT_TOKENS_PATHS = new Set(['/v1/messages/count_tokens', '/messages/count_tokens']);
@@ -71,8 +88,12 @@ export function selectOrder(modelId) {
     const pinned = eligible.find((a) => a.id === activeId);
     return { order: pinned ? [pinned] : [], manual, eligible };
   }
+  const tier = modelId ? tierOf(modelId) : 'free';
   const idx = eligible.findIndex((a) => a.id === activeId);
-  const order = idx >= 0 ? [...eligible.slice(idx), ...eligible.slice(0, idx)] : eligible;
+  // 钉住的号只在"和最优先那一档同级"时才当起点：否则一次付费请求把指针挪到
+  // 付费专用号上之后，后面的免费流量会一直去啃那个号
+  const sticky = idx >= 0 && rank(eligible[idx], tier) === rank(eligible[0], tier);
+  const order = sticky ? [...eligible.slice(idx), ...eligible.slice(0, idx)] : eligible;
   return { order, manual, eligible };
 }
 
@@ -135,10 +156,16 @@ function send(res, status, obj, extra = {}) {
 /** 上游/账号级失败的归类，用来回写账号状态 */
 function classifyFailure(status, text) {
   const t = String(text || '');
-  if (/banned/i.test(t)) return 'banned';
-  if (/create session failed:\s*401|unauthorized|invalid api key|token_invalid/i.test(t)) return 'token_invalid';
-  if (/country_blocked/i.test(t)) return 'country_blocked';
+  // token_invalid / banned 会把号从池子里剔掉，所以只在上游明确用 401/403 拒绝时才下这个结论。
+  // 否则模型正文或者别的报错里出现一句 "unauthorized" 就会把好号误杀。
+  if (status === 401 || status === 403) {
+    if (/banned/i.test(t)) return 'banned';
+    if (/country_blocked/i.test(t)) return 'country_blocked';
+    if (/(create session failed:\s*401|invalid api key|token_invalid|unauthorized)/i.test(t)) return 'token_invalid';
+    return 'blocked';
+  }
   if (status === 429 || /\b429\b|quota|rate.?limit|额度/i.test(t)) return 'rate_limited';
+  if (/create session failed:\s*401/i.test(t)) return 'token_invalid';
   return 'upstream_error';
 }
 
@@ -147,6 +174,7 @@ const FAILURE_TEXT = {
   token_invalid: 'token 失效',
   country_blocked: '地区受限',
   rate_limited: '额度用完',
+  blocked: '上游拒绝',
   upstream_error: '上游失败',
 };
 
@@ -213,6 +241,13 @@ export function createAnthropicStreamPatcher() {
   return {
     push(text) {
       buf += text;
+      // 兜底：万一上游给出一段永远没有事件边界的内容，别把它无限攒在内存里
+      if (buf.length > 1024 * 1024) {
+        const out = buf;
+        buf = '';
+        done = true;
+        return out;
+      }
       let out = '';
       let idx;
       while ((idx = buf.indexOf('\n\n')) >= 0) {
@@ -249,6 +284,36 @@ function validateRequest(pathname, parsed) {
   return null;
 }
 
+/**
+ * 请求体过大时的收尾。分两种：
+ *  - 只是稍微超（声明大小在上限 4 倍以内）：把它读完丢掉再回 413，
+ *    这样客户端能干净地看到状态码，keep-alive 连接也还能复用；
+ *  - 大得离谱或者不声明长度：回完就关连接，不给人白占带宽的机会
+ *    （这种情况下客户端可能只看到连接被关，这是 HTTP 的固有含糊之处）。
+ */
+async function rejectTooLarge(req, res, pathname, message, status = 413) {
+  const declared = Number(req.headers['content-length'] || 0);
+  const drainBudget = config.maxBodyBytes * 4;
+  if (Number.isFinite(declared) && declared > 0 && declared <= drainBudget) {
+    try {
+      for await (const _chunk of req) {
+        /* 丢掉 */
+      }
+    } catch {
+      /* 客户端自己断了也无所谓 */
+    }
+    send(res, status, errorBody(pathname, message, status));
+    return;
+  }
+  send(res, status, errorBody(pathname, message, status), { connection: 'close' });
+  req.resume();
+  const timer = setTimeout(() => {
+    if (!req.destroyed) req.destroy();
+  }, 2000);
+  req.once('end', () => clearTimeout(timer));
+  req.once('error', () => clearTimeout(timer));
+}
+
 /** 内部调用 worker（管理后台探活、模型列表、自检都用这个），不经过 Node socket */
 export async function callWorker(pathname, { method = 'GET', tokens = [], key = 'internal-key', body = null, headers = {} } = {}) {
   const request = new Request(`http://internal${pathname}`, {
@@ -259,31 +324,59 @@ export async function callWorker(pathname, { method = 'GET', tokens = [], key = 
   return worker.fetch(request, buildEnv(tokens, key));
 }
 
-/** 处理对外 API 请求（/v1/*）。 */
+/** 处理对外 API 请求（/v1/*）。外面套一层在飞计数闸门。 */
 export async function handleApiRequest(req, res, url) {
-  const pathname = url.pathname;
-  const isAnthropic = ANTHROPIC_PATHS.has(pathname);
-
   if (req.method === 'OPTIONS') {
     res.writeHead(204, CORS);
     res.end();
     return;
   }
+  if (!apiGate.tryEnter()) {
+    console.warn(`[engine] 在飞请求已达上限 ${config.maxInflightApi}，拒掉 ${url.pathname}`);
+    send(res, 503, errorBody(url.pathname, '网关正忙（同时处理的请求已达上限），稍后重试', 503), { 'retry-after': '5' });
+    return;
+  }
+  try {
+    await dispatchApi(req, res, url);
+  } finally {
+    apiGate.leave();
+  }
+}
+
+async function dispatchApi(req, res, url) {
+  const pathname = url.pathname;
+  const isAnthropic = ANTHROPIC_PATHS.has(pathname);
 
   const presented = extractPresentedKey(req);
   const keyRecord = store.findKey(presented);
   if (!keyRecord || !keyRecord.enabled) {
-    const message = keyRecord && !keyRecord.enabled ? 'API key 已被停用' : 'Invalid API key';
-    send(res, 401, errorBody(pathname, message, 401));
+    // 存在但被停用 / 完全不存在，对外都只说一句 Invalid API key —— 区分开来
+    // 等于给攻击者一个"这个 key 存在"的探测口
+    const ip = clientIp(req, config.trustProxyHops);
+    const gate = keyFailLimiter.check(`key:${ip}`);
+    keyFailLimiter.hit(`key:${ip}`);
+    if (!gate.ok) {
+      send(res, 429, errorBody(pathname, '认证失败次数过多，稍后再试', 429), { 'retry-after': '60' });
+      return;
+    }
+    if (keyRecord && !keyRecord.enabled) console.warn(`[engine] 停用的 key 被使用（${keyRecord.id}）from ${ip}`);
+    send(res, 401, errorBody(pathname, 'Invalid API key', 401));
     return;
   }
 
   let raw = Buffer.alloc(0);
   if (req.method === 'POST') {
+    // 先看 Content-Length，超了就不用把字节读进来了
+    const declared = Number(req.headers['content-length'] || 0);
+    if (Number.isFinite(declared) && declared > config.maxBodyBytes) {
+      await rejectTooLarge(req, res, pathname, `请求体过大（上限 ${Math.round(config.maxBodyBytes / 1024 / 1024)}MB）`);
+      return;
+    }
     try {
-      raw = await readBody(req, 32 * 1024 * 1024);
+      raw = await readBody(req, config.maxBodyBytes);
     } catch (err) {
-      send(res, err.statusCode || 400, errorBody(pathname, err.message, 400));
+      // 没读完的请求体会让这条 keep-alive 连接没法复用，所以明确关连接
+      await rejectTooLarge(req, res, pathname, err.message, err.statusCode || 400);
       return;
     }
   }
@@ -309,29 +402,37 @@ export async function handleApiRequest(req, res, url) {
     }
   }
 
+  const isModelList = MODEL_LIST_PATHS.has(pathname) && req.method === 'GET';
+  const isCountTokens = COUNT_TOKENS_PATHS.has(pathname);
+  // 会真正打上游、要花额度的路径 —— 这些请求必须过模型门禁
+  const needsModelAuth = !isModelList && !isCountTokens && req.method === 'POST';
+
   // 模型解析：Anthropic 客户端常发 claude-xxx，映射到上游免费模型；
   // 既不是已知模型、也不像 Claude 系的名字，就按 404 报错，而不是悄悄换个模型跑
-  let requestedModel = '';
-  if (parsed && typeof parsed.model === 'string') {
-    const rawModel = parsed.model.trim();
-    requestedModel = resolveModelId(rawModel, isAnthropic);
-    const aliased = requestedModel !== rawModel;
-    if (aliased && !isKnownModel(rawModel) && !looksLikeClaude(rawModel) && requestedModel === DEFAULT_MODEL) {
-      send(res, 404, errorBody(pathname, `模型 ${rawModel} 不存在；GET /v1/models 可以看当前可用的模型`, 404));
-      return;
-    }
+  const rawModel = parsed && typeof parsed.model === 'string' ? parsed.model.trim() : '';
+  let requestedModel = rawModel ? resolveModelId(rawModel, isAnthropic) : '';
+  if (rawModel && requestedModel !== rawModel && !isKnownModel(rawModel) && !looksLikeClaude(rawModel) && requestedModel === DEFAULT_MODEL) {
+    send(res, 404, errorBody(pathname, `模型 ${rawModel} 不存在；GET /v1/models 可以看当前可用的模型`, 404));
+    return;
   }
+  // 没写 model 的请求上游会按默认模型跑，所以这里也得按默认模型去过门禁 ——
+  // 否则"不带 model"就成了绕开 key 白名单和已下架模型的口子
+  if (needsModelAuth && !requestedModel) requestedModel = DEFAULT_MODEL;
 
-  if (requestedModel) {
+  if (needsModelAuth) {
     const verdict = checkModelAccess(keyRecord, requestedModel);
     if (!verdict.ok) {
       send(res, verdict.status, errorBody(pathname, verdict.message, verdict.status));
       return;
     }
+    // 把解析后的模型 id 写回请求体：判定用的是这个 id，转发给引擎的也必须是这个 id，
+    // 不然两边的模型表一旦分叉，就可能"按免费判定、按付费执行"
+    if (parsed && requestedModel && parsed.model !== requestedModel) {
+      parsed.model = requestedModel;
+      raw = Buffer.from(JSON.stringify(parsed));
+    }
   }
 
-  const isModelList = MODEL_LIST_PATHS.has(pathname) && req.method === 'GET';
-  const isCountTokens = COUNT_TOKENS_PATHS.has(pathname);
   const makeRequest = () =>
     new Request(`${url.origin || 'http://internal'}${pathname}${url.search}`, {
       method: req.method,
@@ -415,19 +516,22 @@ export async function handleApiRequest(req, res, url) {
   }
 
   if (!hit) {
-    const detail = last ? String(last.text || '').slice(0, 300) : '没有可用账号';
-    const who = last?.acct ? `账号 ${last.acct.email || last.acct.id}` : '账号';
+    // 对外只给归类结论，不回上游原文 —— 原文里可能带账号/内部细节，
+    // 完整内容写进服务端日志和账号状态列
+    const reason = last ? FAILURE_TEXT[last.state] || '上游失败' : '没有可用账号';
     const suffix = manual
       ? '（手动模式：不会自动换号，去控制台换一个账号或打开自动切换）'
       : order.length > 1
         ? `（已依次试过 ${order.length} 个账号）`
         : '';
-    send(
-      res,
-      last?.status === 429 ? 429 : 502,
-      errorBody(pathname, `${who} 调用上游失败：${detail}${suffix}`, last?.status === 429 ? 429 : 502),
-      { 'x-myapi-accounts-tried': tried.join(',') || '0' }
+    console.warn(
+      `[engine] ${pathname} 全部账号失败：${tried.join(', ')}${last ? ` | 最后一条：HTTP ${last.status} ${String(last.text).slice(0, 300)}` : ''}`
     );
+    const status = last?.status === 429 ? 429 : 502;
+    send(res, status, errorBody(pathname, `上游调用失败（${reason}）${suffix}，详情见控制台的账号状态`, status), {
+      'x-myapi-accounts-tried': String(tried.length),
+      ...(status === 429 ? { 'retry-after': '60' } : {}),
+    });
     return;
   }
 
@@ -437,14 +541,14 @@ export async function handleApiRequest(req, res, url) {
     store.setAccountStatus(used.id, { state: 'ok', verdict: '存活', detail: '刚刚成功承接了一次请求', quota: used.status.quota || '', source: 'request' });
   }
 
+  // 白名单透传：上游头里可能有 set-cookie / access-control-* 之类，
+  // 原样转出去等于让上游在本网关域名下写 cookie、改 CORS 策略
   const headers = {};
   for (const [k, v] of response.headers.entries()) {
-    if (['content-encoding', 'content-length', 'transfer-encoding'].includes(k.toLowerCase())) continue;
-    headers[k] = v;
+    if (PASS_HEADERS.has(k.toLowerCase())) headers[k] = v;
   }
-  headers['x-myapi-account'] = used.id;
   headers['x-myapi-rotation'] = manual ? 'manual' : 'sticky';
-  if (tried.length) headers['x-myapi-accounts-tried'] = tried.join(',');
+  if (tried.length) headers['x-myapi-accounts-tried'] = String(tried.length);
   if (requestedModel) headers['x-myapi-model-tier'] = tierOf(requestedModel);
   if (isAnthropic) headers['request-id'] = `req_${randomId(12)}`;
 
@@ -473,25 +577,40 @@ export async function handleApiRequest(req, res, url) {
   const patcher = isAnthropic && isSse ? createAnthropicStreamPatcher() : null;
   const decoder = patcher ? new TextDecoder() : null;
   const reader = response.body.getReader();
+  // 客户端一断开就把上游流也取消掉：不取消的话上游会继续把整段输出生成完，
+  // 那条 session 也一直占着 —— 相当于让人用"发出即断"白烧号池额度
+  let aborted = false;
+  const onClientGone = () => {
+    aborted = true;
+    reader.cancel().catch(() => {});
+  };
+  res.once('close', onClientGone);
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (!value || res.writableEnded) continue;
-      if (patcher) {
-        const out = patcher.push(decoder.decode(value, { stream: true }));
-        if (out) res.write(out);
-      } else {
-        res.write(Buffer.from(value));
+      if (aborted || res.writableEnded || res.destroyed) break;
+      if (!value) continue;
+      const chunk = patcher ? patcher.push(decoder.decode(value, { stream: true })) : Buffer.from(value);
+      if (!chunk || (patcher && !chunk.length)) continue;
+      // 尊重背压：写不动的时候等 drain，否则慢客户端会把内存撑起来
+      if (!res.write(chunk)) {
+        await new Promise((resolve) => {
+          const done2 = () => resolve();
+          res.once('drain', done2);
+          res.once('close', done2);
+        });
       }
     }
-    if (patcher && !res.writableEnded) {
+    if (patcher && !aborted && !res.writableEnded) {
       const rest = patcher.flush();
       if (rest) res.write(rest);
     }
   } catch {
     // 客户端断流是常态，不当错误处理
   } finally {
+    res.off('close', onClientGone);
+    if (!aborted) reader.cancel().catch(() => {});
     if (!res.writableEnded) res.end();
   }
 }

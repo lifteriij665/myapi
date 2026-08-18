@@ -4,7 +4,7 @@
 //   3) 对外 OpenAI / Anthropic 兼容 API（/v1/*，交给 vendor/worker.js 引擎）
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
-import { resolve, normalize, extname } from 'node:path';
+import { resolve, normalize, extname, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { WebSocketServer } from 'ws';
@@ -37,7 +37,9 @@ function isApiPath(pathname) {
 async function serveStatic(req, res, pathname) {
   const rel = pathname === '/' ? 'index.html' : normalize(pathname).replace(/^([/\\.]+)/, '');
   const file = resolve(config.publicDir, rel);
-  if (!file.startsWith(config.publicDir)) {
+  // 必须是 publicDir 本身或它下面的文件；只用 startsWith 会把同前缀的兄弟目录
+  // （/app/public-evil）也放进来
+  if (file !== config.publicDir && !file.startsWith(config.publicDir + sep)) {
     sendText(res, 403, 'forbidden');
     return true;
   }
@@ -80,19 +82,26 @@ async function requestHandler(req, res) {
   const pathname = url.pathname;
 
   try {
-    // 健康检查：免鉴权，给 Railway 的 healthcheck 和外部监控用
+    // 健康检查：免鉴权，给 Railway 的 healthcheck 和外部监控用。
+    // 对外只说"活着 / 有没有号"，账号数、key 数这些留给登录后的 /admin/api/state，
+    // 免得公网上任何人都能摸清这个部署的规模。
     if (pathname === '/healthz' || pathname === '/health') {
-      const accounts = store.accounts.filter((a) => a.enabled);
-      sendJson(res, 200, {
-        status: accounts.length ? 'ok' : 'no_accounts',
+      const usable = store.accounts.filter((a) => a.enabled).length;
+      const base = {
+        status: store.accounts.length === 0 ? 'no_accounts' : usable === 0 ? 'no_enabled_accounts' : 'ok',
         version: config.version,
-        accounts: accounts.length,
-        accounts_total: store.accounts.length,
-        keys: store.keys.filter((k) => k.enabled !== false).length,
-        storage_persistent: config.persistentData,
-        browser_login: browserFeature().available,
         time: new Date().toISOString(),
-      });
+      };
+      const detail = isAuthed(req)
+        ? {
+            accounts: usable,
+            accounts_total: store.accounts.length,
+            keys: store.keys.filter((k) => k.enabled !== false).length,
+            storage_persistent: config.persistentData,
+            browser_login: browserFeature().available,
+          }
+        : null;
+      sendJson(res, 200, detail ? { ...base, ...detail } : base);
       return;
     }
 
@@ -140,7 +149,7 @@ export function createApp() {
   if (!store.hasPassword()) {
     generatedPassword = randomBytes(9).toString('base64url');
     try {
-      store.setPassword(generatedPassword);
+      store.setPassword(generatedPassword, { generated: true });
     } catch {}
     console.log('');
     console.log('==========================================================');
@@ -159,6 +168,7 @@ export function createApp() {
   // 内置浏览器画面：WebSocket 只允许已登录的管理会话接入
   const wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
   server.on('upgrade', (req, socket, head) => {
+   try {
     let url;
     try {
       url = new URL(req.url, 'http://internal');
@@ -169,6 +179,20 @@ export function createApp() {
     if (url.pathname !== '/admin/ws/browser') {
       socket.destroy();
       return;
+    }
+    // WebSocket 握手不受 CORS 约束，所以自己校验 Origin：浏览器发起的跨站握手一律拒绝
+    const origin = req.headers.origin;
+    if (origin) {
+      let sameSite = false;
+      try {
+        const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toString().split(',')[0].trim();
+        sameSite = new URL(origin).host === host;
+      } catch {}
+      if (!sameSite) {
+        socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
     }
     if (!isAuthed(req)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
@@ -193,6 +217,10 @@ export function createApp() {
       ws.on('close', () => session.removeClient(ws));
       ws.on('error', () => session.removeClient(ws));
     });
+   } catch (err) {
+    console.error(`[server] WebSocket 升级处理出错：${err.message}`);
+    try { socket.destroy(); } catch {}
+   }
   });
 
   return { server, generatedPassword };

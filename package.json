@@ -12,7 +12,8 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "update-worker": "node scripts/update-worker.mjs",
-    "check": "node scripts/check.mjs"
+    "check": "node scripts/check.mjs",
+    "test": "node tests/run.mjs"
   },
   "dependencies": {
     "patchright": "1.61.1",

@@ -77,6 +77,28 @@ export async function startFlow({ mode = 'link', pool = 'any' } = {}) {
     throw Object.assign(new Error(`向上游申请登录链接失败：${detail}`), { statusCode: 502 });
   }
 
+  // loginUrl 是上游给的，不能无条件信：必须是 https 的公网地址，
+  // 否则内置浏览器就会被上游牵着去访问容器内网 / 本地文件
+  let loginUrl;
+  try {
+    const u = new URL(String(resp.data.loginUrl));
+    const host = u.hostname.toLowerCase();
+    const privateHost =
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host.endsWith('.internal') ||
+      /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host) ||
+      host === '::1';
+    if (u.protocol !== 'https:' || privateHost) throw new Error('协议或地址不可信');
+    loginUrl = u.toString();
+    const upstreamHost = new URL(config.upstreamBase).hostname;
+    if (host !== upstreamHost.toLowerCase()) {
+      console.warn(`[login] 上游返回的登录域名 ${host} 与 ${upstreamHost} 不一致，仍继续但请留意`);
+    }
+  } catch (err) {
+    throw Object.assign(new Error(`上游返回的登录链接不可信（${err.message}），已中止`), { statusCode: 502 });
+  }
+
   const flow = {
     id: randomId(6),
     state: 'pending',
@@ -85,7 +107,7 @@ export async function startFlow({ mode = 'link', pool = 'any' } = {}) {
     fingerprintId: fid,
     fingerprintHash: resp.data.fingerprintHash,
     expiresAt: resp.data.expiresAt,
-    loginUrl: resp.data.loginUrl,
+    loginUrl,
     createdAt: Date.now(),
     deadline: Date.now() + config.loginPollTimeoutMs,
     attempts: 0,

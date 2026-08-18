@@ -1,11 +1,13 @@
 // 数据落盘：一个 JSON 文件放账号池 / API key / 设置。
 // 原子写（tmp + rename）+ 0600 权限；写入做 200ms 合并，避免频繁 IO。
 import { readFileSync, writeFileSync, renameSync, existsSync, chmodSync, mkdirSync } from 'node:fs';
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
 import { dirname } from 'node:path';
 import { config } from './config.js';
-import { randomId, generateApiKey, nowIso } from './util.js';
+import { randomId, generateApiKey, nowIso, constantTimeEqual } from './util.js';
 
+const scryptAsync = promisify(scrypt);
 const CURRENT_VERSION = 1;
 
 function emptyData() {
@@ -13,7 +15,10 @@ function emptyData() {
     version: CURRENT_VERSION,
     createdAt: nowIso(),
     secret: randomBytes(32).toString('hex'),
-    adminPassword: null, // { salt, hash } —— 在控制台改过密码才有；否则用环境变量 ADMIN_PASSWORD
+    // 会话世代号：改密码 / 一键登出会 +1，已经签发的 cookie 立刻作废。
+    // 这样即使配了固定的 SESSION_SECRET（secret 不轮换），吊销也是真的生效。
+    sessionEpoch: 1,
+    adminPassword: null, // { salt, hash, generated? } —— 在控制台改过密码才有；否则用环境变量 ADMIN_PASSWORD
     settings: {
       allowPaidDefault: config.allowPaidDefault,
       disabledModels: [], // 手动下架的模型 id
@@ -58,6 +63,15 @@ class Store {
       }
     }
     if (config.sessionSecret) this.data.secret = config.sessionSecret;
+    if (!Number.isFinite(this.data.sessionEpoch)) this.data.sessionEpoch = 1;
+    // 首次部署时自动生成的密码是明文打进部署日志的。一旦管理员补上了
+    // ADMIN_PASSWORD，就把那个自动生成的作废 —— 否则躺在日志里的密码永久有效。
+    if (config.adminPassword && this.data.adminPassword?.generated) {
+      this.data.adminPassword = null;
+      this.data.sessionEpoch += 1;
+      console.warn('[store] 检测到 ADMIN_PASSWORD，已作废首次启动时自动生成的那个临时密码（它明文出现在部署日志里）');
+    }
+    this._invalidateKeyIndex();
     this._loaded = true;
     this.seedFromEnv();
     this.saveNow();
@@ -95,7 +109,10 @@ class Store {
         changed = true;
       }
     }
-    if (changed) this.save();
+    if (changed) {
+      this._invalidateKeyIndex();
+      this.save();
+    }
   }
 
   save() {
@@ -126,29 +143,58 @@ class Store {
     return Boolean(config.adminPassword || this.data.adminPassword);
   }
 
-  verifyPassword(password) {
+  /** 当前有几种可用的登录凭证，控制台里显示出来，免得用户不知道日志里那个还有效 */
+  credentialSources() {
+    return {
+      env: Boolean(config.adminPassword),
+      console: Boolean(this.data.adminPassword),
+      consoleGenerated: Boolean(this.data.adminPassword?.generated),
+    };
+  }
+
+  /**
+   * 校验管理密码。用异步 scrypt（走 libuv 线程池）：scryptSync 每次要几十毫秒，
+   * 并发爆破能靠它把单线程事件循环卡死，连 /healthz 都超时。
+   */
+  async verifyPassword(password) {
     const input = String(password ?? '');
     let ok = false;
     // 环境变量里的密码始终有效（避免在控制台改了密码又忘记后彻底进不去）
     if (config.adminPassword) {
-      const a = Buffer.from(input);
-      const b = Buffer.from(config.adminPassword);
-      if (a.length === b.length && timingSafeEqual(a, b)) ok = true;
+      if (constantTimeEqual(input, config.adminPassword)) ok = true;
     }
-    if (!ok && this.data.adminPassword) {
+    if (this.data.adminPassword) {
       const { salt, hash } = this.data.adminPassword;
-      const attempt = scryptSync(input, salt, 32);
-      const expect = Buffer.from(hash, 'hex');
-      if (attempt.length === expect.length && timingSafeEqual(attempt, expect)) ok = true;
+      try {
+        const attempt = await scryptAsync(input, salt, 32);
+        const expect = Buffer.from(hash, 'hex');
+        // 两边都算完再比，避免"哪一种密码匹配上了"从耗时上露出来
+        if (attempt.length === expect.length && timingSafeEqual(attempt, expect)) ok = true;
+      } catch {
+        /* 数据文件里的 salt/hash 坏了就当不匹配 */
+      }
     }
     return ok;
   }
 
-  setPassword(password) {
-    this.data.adminPassword = hashPassword(password);
-    // 换密码顺手换签名密钥，让旧的登录 cookie 立即失效
+  setPassword(password, { generated = false } = {}) {
+    this.data.adminPassword = { ...hashPassword(password), generated };
+    // 换密码就作废所有已签发的会话：世代号 +1（不依赖 secret 轮换，
+    // 配了固定 SESSION_SECRET 时 secret 是不变的）
+    this.data.sessionEpoch = (Number(this.data.sessionEpoch) || 1) + 1;
     if (!config.sessionSecret) this.data.secret = randomBytes(32).toString('hex');
     this.saveNow();
+  }
+
+  /** 一键把所有设备踢下线 */
+  revokeSessions() {
+    this.data.sessionEpoch = (Number(this.data.sessionEpoch) || 1) + 1;
+    this.saveNow();
+    return this.data.sessionEpoch;
+  }
+
+  get sessionEpoch() {
+    return Number(this.data.sessionEpoch) || 1;
   }
 
   get secret() {
@@ -277,6 +323,7 @@ class Store {
   addKey(opts) {
     const key = this._newKey(opts);
     this.data.keys.push(key);
+    this._invalidateKeyIndex();
     this.save();
     return key;
   }
@@ -297,13 +344,21 @@ class Store {
     const idx = this.data.keys.findIndex((k) => k.id === id);
     if (idx < 0) return false;
     this.data.keys.splice(idx, 1);
+    this._invalidateKeyIndex();
     this.save();
     return true;
   }
 
   findKey(presented) {
-    if (!presented) return null;
-    return this.data.keys.find((k) => k.key === presented) || null;
+    if (!presented || typeof presented !== 'string') return null;
+    // 用 Map 查而不是遍历逐字符比较：查表不会把 key 的公共前缀从耗时上露出来
+    if (!this._keyIndex) this._keyIndex = new Map(this.data.keys.map((k) => [k.key, k]));
+    return this._keyIndex.get(presented) || null;
+  }
+
+  /** keys 数组增删/整体替换后调用（改名、启停用是原地改同一个对象，索引仍然有效） */
+  _invalidateKeyIndex() {
+    this._keyIndex = null;
   }
 
   touchKey(id) {
@@ -380,6 +435,7 @@ class Store {
       result.keys++;
     }
     if (payload.settings) this.updateSettings(payload.settings);
+    this._invalidateKeyIndex();
     this.saveNow();
     return result;
   }

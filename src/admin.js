@@ -18,21 +18,61 @@ import {
   clientIp,
   publicBaseUrl,
   createRateLimiter,
+  createGate,
+  sleep,
   maskSecret,
   nowIso,
 } from './util.js';
 
 const COOKIE = 'myapi_admin';
+// 按 IP 硬限流（10 次/10 分钟）。另外加一道全局软限速：X-Forwarded-For 左边是
+// 客户端可控的，万一取 IP 的方式在某个平台上不准，攻击者可以靠伪造 IP 绕开按 IP 的
+// 计数。全局这道超过阈值后只延迟不拒绝 —— 硬拒会变成"攻击者一直打，管理员自己
+// 也进不来"的拒绝服务。
 const loginLimiter = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
+const loginGlobalLimiter = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 30 });
+const LOGIN_THROTTLE_MS = parseInt(process.env.LOGIN_THROTTLE_MS || '2000', 10);
+// 同一时刻只允许两个密码校验在跑：scrypt 每次几十毫秒，几百个并发请求
+// 能把线程池和事件循环一起拖住，连 /healthz 都会超时
+const loginGate = createGate(2);
+
+/** 密码校验的公共入口：先记账再验证（fail-closed），并发也要走闸门 */
+async function attemptPassword(req, password, ip) {
+  const perIp = loginLimiter.check(`login:${ip}`);
+  if (!perIp.ok) return { ok: false, status: 429, error: `尝试次数过多，请 ${Math.ceil(perIp.retryAfterMs / 60000)} 分钟后再试` };
+  if (!loginGate.tryEnter()) return { ok: false, status: 503, error: '正在处理其它登录请求，稍等一秒再试' };
+  try {
+    // 关键顺序：先把这次尝试记进计数，再去验证。
+    // 反过来（验证失败才记账）意味着同一批并发请求全部通过限流检查。
+    loginLimiter.hit(`login:${ip}`);
+    const globalOk = loginGlobalLimiter.check('login:all').ok;
+    loginGlobalLimiter.hit('login:all');
+    if (!globalOk) {
+      console.warn(`[admin] 全局失败次数偏高，本次尝试延迟 ${LOGIN_THROTTLE_MS}ms（来源 ${ip}）`);
+      await sleep(LOGIN_THROTTLE_MS);
+    }
+    const ok = await store.verifyPassword(password);
+    if (ok) loginLimiter.reset(`login:${ip}`);
+    else console.warn(`[admin] 密码错误 from ${ip}`);
+    return ok ? { ok: true } : { ok: false, status: 401, error: '密码不对' };
+  } finally {
+    loginGate.leave();
+  }
+}
 
 export function isAuthed(req) {
   const token = parseCookies(req)[COOKIE];
   if (!token) return false;
   const payload = verifyToken(token, store.secret);
-  return Boolean(payload && payload.sub === 'admin');
+  if (!payload || payload.sub !== 'admin') return false;
+  // 世代号对不上＝这张 cookie 已经被"改密码 / 一键登出"作废了
+  return Number(payload.epoch || 0) === store.sessionEpoch;
 }
 
 function sameOrigin(req) {
+  // 浏览器会带 Sec-Fetch-Site：cross-site 一律拒，比只看 Origin 可靠
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') return false;
   const origin = req.headers.origin;
   if (!origin) return true; // 非浏览器发起（curl 之类）不做限制
   try {
@@ -45,9 +85,10 @@ function sameOrigin(req) {
 
 function issueCookie(req) {
   const exp = Date.now() + config.sessionTtlMs;
-  const token = signToken({ sub: 'admin', iat: Date.now(), exp }, store.secret);
+  const token = signToken({ sub: 'admin', epoch: store.sessionEpoch, iat: Date.now(), exp }, store.secret);
   const secure = publicBaseUrl(req).startsWith('https://');
-  return serializeCookie(COOKIE, token, { maxAge: config.sessionTtlMs / 1000, secure, sameSite: 'Lax' });
+  // 后台没有"从别的站点跳进来"的需求，用 Strict 把 CSRF 的面再收一层
+  return serializeCookie(COOKIE, token, { maxAge: config.sessionTtlMs / 1000, secure, sameSite: 'Strict' });
 }
 
 function accountView(acct, workerStates) {
@@ -133,7 +174,7 @@ async function buildState(req) {
           states: health.account_states,
         }
       : null,
-    hasCustomPassword: Boolean(store.data.adminPassword),
+    credentials: store.credentialSources(),
   };
 }
 
@@ -152,24 +193,12 @@ export async function handleAdminApi(req, res, url) {
   }
 
   if (path === '/login' && method === 'POST') {
-    const ip = clientIp(req);
-    const limit = loginLimiter.check(`login:${ip}`);
-    if (!limit.ok) {
-      return sendJson(res, 429, {
-        ok: false,
-        error: `密码错误次数过多，请 ${Math.ceil(limit.retryAfterMs / 60000)} 分钟后再试`,
-      });
-    }
-    const body = await readJson(req, 8 * 1024);
     if (!store.hasPassword()) {
       return sendJson(res, 500, { ok: false, error: '服务端没有设置 ADMIN_PASSWORD，请在 Railway 变量里加上后重新部署' });
     }
-    if (!store.verifyPassword(body.password)) {
-      loginLimiter.hit(`login:${ip}`);
-      console.warn(`[admin] 密码错误 from ${ip}`);
-      return sendJson(res, 401, { ok: false, error: '密码不对' });
-    }
-    loginLimiter.reset(`login:${ip}`);
+    const body = await readJson(req, 8 * 1024);
+    const verdict = await attemptPassword(req, body.password, clientIp(req, config.trustProxyHops));
+    if (!verdict.ok) return sendJson(res, verdict.status, { ok: false, error: verdict.error });
     return sendJson(res, 200, { ok: true }, { 'set-cookie': issueCookie(req) });
   }
 
@@ -190,9 +219,28 @@ export async function handleAdminApi(req, res, url) {
   if (path === '/password' && method === 'POST') {
     const body = await readJson(req, 8 * 1024);
     const next = String(body.next || '');
-    if (next.length < 6) return sendJson(res, 400, { ok: false, error: '新密码至少 6 位' });
+    // 必须先验当前密码：只偷到一份 cookie 的人不该能改掉密码把真管理员锁在外面
+    const verdict = await attemptPassword(req, body.current, clientIp(req, config.trustProxyHops));
+    if (!verdict.ok) {
+      return sendJson(res, verdict.status === 401 ? 403 : verdict.status, {
+        ok: false,
+        error: verdict.status === 401 ? '当前密码不对' : verdict.error,
+      });
+    }
+    if (next.length < 10) return sendJson(res, 400, { ok: false, error: '新密码至少 10 位' });
+    if (/^\d+$/.test(next)) return sendJson(res, 400, { ok: false, error: '别用纯数字密码' });
     store.setPassword(next);
-    return sendJson(res, 200, { ok: true, note: '密码已更新，其它设备的登录状态已失效' }, { 'set-cookie': issueCookie(req) });
+    return sendJson(
+      res,
+      200,
+      { ok: true, note: '密码已更新，其它设备上的登录状态已全部失效' },
+      { 'set-cookie': issueCookie(req) }
+    );
+  }
+
+  if (path === '/logout-all' && method === 'POST') {
+    store.revokeSessions();
+    return sendJson(res, 200, { ok: true, note: '所有设备都已登出' }, { 'set-cookie': issueCookie(req) });
   }
 
   // --- 账号池 ---
@@ -364,10 +412,10 @@ export async function handleAdminApi(req, res, url) {
   }
 
   // --- 备份 / 恢复 / 自检 ---
-  if (path === '/export' && method === 'GET') {
-    return sendJson(res, 200, store.exportData(), {
-      'content-disposition': `attachment; filename="myapi-backup-${Date.now()}.json"`,
-    });
+  // 用 POST 而不是 GET：GET 会落进"恶意页面顶层导航也能触发"的口子里
+  // （SameSite 在顶层导航时仍可能带上 cookie），而这个接口吐的是全量明文 token
+  if (path === '/export' && method === 'POST') {
+    return sendJson(res, 200, store.exportData(), { 'cross-origin-resource-policy': 'same-origin' });
   }
 
   if (path === '/import' && method === 'POST') {
