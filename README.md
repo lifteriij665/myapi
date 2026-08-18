@@ -120,6 +120,25 @@ API Key    sk-fb-xxxxxxxx
 - `仅免费`：只承接免费模型，Premium 额度留着
 - `付费优先`：付费模型优先落到它头上
 
+## 三点五、账号怎么切（不轮询）
+
+默认策略是**钉住一个号用到失败为止**，不是轮询：
+
+- 每个请求只把**一个** token 交给引擎，所以引擎内部那套轮询逻辑等于被关掉了
+- 只有当前这个号真的失败了（额度用完 / token 失效 / 上游拒绝 / 超时），才顺延到下一个号，并把新号钉住
+- 顺延时会把失败原因写回控制台的状态列，`x-myapi-accounts-tried` 响应头里能看到这次试过哪些号
+- 这样比轮询省额度：freebuff 是**按创建 session 计费**的，一个 session 能用约 1 小时，钉住同一个号就能把这一小时用满
+
+控制台「设置 → 账号切换」里有两个开关：
+
+| 设置 | 行为 |
+|---|---|
+| **自动切换账号**（默认开） | 当前号失败才换下一个；换完的号会成为新的"当前号" |
+| 关掉自动切换 | **只用**你指定的那个号，它不可用时请求直接返回 503，绝不偷偷换号 |
+| **当前使用的账号** | 手动指定从哪个号开始用；留空＝下一次请求自己挑第一个可用的 |
+
+「账号池」里每行都有「设为当前」按钮，概览的通道条上当前那个号会标 `当前`。
+
 ---
 
 ## 四、环境变量
@@ -219,7 +238,7 @@ Google 对自动化浏览器有额外风控。patchright + headful(Xvfb) 已经�
 freebuff 免费模型限美国出口 IP。Railway 的美国区一般没问题；不是美国区就换区域，或者给容器配代理。
 
 **返回 429 / 额度用完？**
-Premium 池是全账号 6 次 session/天（太平洋日，北京时间 15:00 前后重置）。多加几个号，或者把 key 的「付费模型」取消勾选、只用免费模型。
+Premium 池是全账号 6 次 session/天（按太平洋日切换，UTC+8 的 15:00 前后重置）。多加几个号，或者把 key 的「付费模型」取消勾选、只用免费模型。
 
 **账号突然全部失效？**
 看控制台状态列：`token 失效` 重新登录就行；`已封禁` 是终态，官方不可恢复 —— 这是用这类代理的固有风险。
@@ -229,7 +248,37 @@ Premium 池是全账号 6 次 session/天（太平洋日，北京时间 15:00 �
 
 ---
 
-## 八、风险与许可
+## 八、关于第三方"中转检测"报告
+
+拿 claude-detector 这类工具扫这个网关，会报一堆红色。分清楚哪些是真问题：
+
+**上游行为，本项目改不了**
+
+- **每个请求多出 ~418 个 input_token**：freebuff 服务端会自己注入一段产品级 system prompt（`You are Buffy, the strategic coding assistant.` 那一整段，含 thinking budget 和 identity 段落）。检测工具按"用户消息应该只有 5 个 token"算，于是报「input 虚高 6860%」「成本倍率 11.9」。这不是中转层加的东西，也不可能去掉 —— 上游用它做 free-mode 校验，删了直接 403。
+- **模型自称 Buffy / 说自己由 Anthropic 训练**：同样来自上游那段 prompt，不是我们改写身份。
+- **prompt caching、PDF 文档输入不支持**：上游没有这些能力。
+- **`stop_sequences` / `max_tokens` 不生效**：参数原样转发了，但上游不认。中间层不做"猜着截断"——那会把 JSON 和工具调用切坏。要严格截断请在客户端做。
+
+**本项目的问题，已经修了**
+
+- Anthropic 响应的 `id` 现在保证是 `msg_` 前缀（之前是裸 UUID，严格的 SDK / 检测器会判 schema 不合规），流式的 `message_start` 也一起修正
+- `usage` 补上 `cache_creation_input_tokens` / `cache_read_input_tokens`（恒为 0）
+- Anthropic 响应加 `request-id` 头
+- 请求体写错的情况现在返回 400（缺 `messages`、`model` 不是字符串、`max_tokens` 不是数字），不再拿去消耗一次 session
+- Anthropic 端点上传一个根本不存在的模型返回 404 `not_found_error`；但 `claude-*` / `sonnet` / `opus` / `haiku` 这类名字仍然会被映射到免费模型（Claude 客户端要靠这个别名才能用）
+- `/v1/messages/count_tokens` 和 `/v1/models` 不再要求号池非空（它们不碰上游）
+
+**Railway 的问题：没有**
+
+报告里 DNS / WHOIS / SSL 那几项取不到或者看着奇怪，是审计脚本在本机做域名解析拿到的结果，跟这个部署没关系。`x-railway-*` 响应头正常。
+
+**检测工具自己的误判**
+
+- 「Stream model 不含 claude → 疑似替换模型」：你请求的本来就是 `deepseek/deepseek-v4-flash`，这是个 Claude 专用检测器。
+- 「真伪验证：存疑 · 逆向代理 · 96%」：这个判定是用来识别"假装官方 Anthropic API 的中转"的。本项目从来不假装是 Anthropic —— 它是 freebuff 的协议代理，被判成"逆向代理"是**描述正确**，不是缺陷。
+- 多个探针写着 `探针异常: not enough values to unpack (expected 5, got 4)`：那是审计脚本自己解包报错，跟我们返回什么无关。
+
+## 九、风险与许可
 
 - 本项目基于 [pingmike2/freebuff2api-wokers](https://github.com/pingmike2/freebuff2api-wokers)（AGPL-3.0）二次开发，同样以 **AGPL-3.0** 开源，保留原作者版权声明
 - 通过逆向协议代理 freebuff/codebuff，**违反其服务条款**，账号存在被永久封禁的风险，**后果自负**

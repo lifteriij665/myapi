@@ -219,6 +219,9 @@ a:hover { text-decoration: underline; }
 .ch-meter.free i { background: var(--signal); }
 .ch-quota { font-family: var(--mono); font-size: 9.5px; color: var(--muted-2); }
 .ch[data-off="1"] { opacity: 0.45; }
+.ch.is-active { border-color: var(--signal-dim); box-shadow: inset 0 0 0 1px rgba(79, 211, 154, 0.16); }
+.ch-now { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.08em; color: var(--signal); }
+.tag.now { color: var(--signal); border-color: var(--signal-dim); background: rgba(79, 211, 154, 0.08); }
 .ch.ghost {
   border-style: dashed;
   background: none;

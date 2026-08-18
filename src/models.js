@@ -17,7 +17,12 @@ const RELEASE_SOURCES = [
 ];
 const REFRESH_MS = 6 * 60 * 60 * 1000;
 // 与 worker.js 的 DEFAULT_MODEL 保持一致（客户端没指定模型时上游走它）
-const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash';
+export const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash';
+
+/** 客户端传的模型名看起来是不是 Claude 系（Anthropic 客户端会发 claude-xxx，需要别名兜底） */
+export function looksLikeClaude(raw) {
+  return /claude|sonnet|opus|haiku|anthropic|fable|mythos/i.test(String(raw || ''));
+}
 
 const bundled = JSON.parse(readFileSync(resolve(ROOT, 'vendor/freebuff-models.json'), 'utf8'));
 

@@ -112,7 +112,7 @@
     <!-- ─────────── 账号池 ─────────── -->
     <section class="view hidden" data-view="accounts">
       <div class="toolbar">
-        <p class="muted small grow">多号轮换由引擎自动完成；「用途」决定这个号接不接付费模型。</p>
+        <p class="muted small grow">默认钉住一个号用到失败才换下一个（不轮询，省 session 额度）；「用途」决定这个号接不接付费模型。</p>
         <span class="toolbar-acts">
           <button class="btn" id="btn-check-all">全部检测</button>
           <button class="btn primary" id="btn-add-account">添加账号</button>
@@ -181,6 +181,21 @@
     <!-- ─────────── 设置 ─────────── -->
     <section class="view hidden" data-view="settings">
       <div class="split">
+        <div class="panel">
+          <div class="panel-title">账号切换</div>
+          <label class="row-toggle">
+            <span>自动切换账号
+              <small class="muted" style="display:block">当前账号失败了（额度用完 / token 失效 / 上游拒绝）才换下一个，不做轮询。关掉就只用下面指定的那一个。</small>
+            </span>
+            <input type="checkbox" class="switch" id="set-autoswitch">
+          </label>
+          <label class="field" style="margin-top:14px">
+            <span class="lbl">当前使用的账号</span>
+            <select id="set-active"></select>
+          </label>
+          <p class="muted small" id="rotation-note"></p>
+        </div>
+
         <div class="panel">
           <div class="panel-title">默认行为</div>
           <label class="row-toggle">

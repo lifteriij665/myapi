@@ -19,6 +19,10 @@ function emptyData() {
       disabledModels: [], // 手动下架的模型 id
       modelTierOverrides: {}, // modelId -> 'free' | 'paid'
       browserLoginEnabled: config.enableBrowserLogin,
+      // 账号选择：钉住一个号用到失败为止（不轮询）。autoSwitch=false 时只用
+      // activeAccountId 指定的那个号，失败也不自动换。
+      autoSwitch: true,
+      activeAccountId: null,
     },
     accounts: [],
     keys: [],
@@ -213,6 +217,10 @@ class Store {
       acct.status = null;
     }
     acct.updatedAt = nowIso();
+    // 停用了当前正在用的号就把指针放开，让下一次请求自己挑
+    if (acct.enabled === false && this.data.settings.activeAccountId === id) {
+      this.data.settings.activeAccountId = null;
+    }
     this.save();
     return acct;
   }
@@ -221,8 +229,21 @@ class Store {
     const idx = this.data.accounts.findIndex((a) => a.id === id);
     if (idx < 0) return false;
     this.data.accounts.splice(idx, 1);
+    if (this.data.settings.activeAccountId === id) this.data.settings.activeAccountId = null;
     this.save();
     return true;
+  }
+
+  /** 记录"现在正在用哪个号"，请求成功后由引擎层回写 */
+  setActiveAccount(id) {
+    if (this.data.settings.activeAccountId === id) return;
+    this.data.settings.activeAccountId = id;
+    this.save();
+  }
+
+  get activeAccount() {
+    const id = this.data.settings.activeAccountId;
+    return id ? this.data.accounts.find((a) => a.id === id) || null : null;
   }
 
   setAccountStatus(id, status) {
@@ -303,6 +324,11 @@ class Store {
     const s = this.data.settings;
     if ('allowPaidDefault' in patch) s.allowPaidDefault = Boolean(patch.allowPaidDefault);
     if ('browserLoginEnabled' in patch) s.browserLoginEnabled = Boolean(patch.browserLoginEnabled);
+    if ('autoSwitch' in patch) s.autoSwitch = Boolean(patch.autoSwitch);
+    if ('activeAccountId' in patch) {
+      const id = patch.activeAccountId ? String(patch.activeAccountId) : null;
+      s.activeAccountId = id && this.data.accounts.some((a) => a.id === id) ? id : null;
+    }
     if (Array.isArray(patch.disabledModels)) s.disabledModels = patch.disabledModels.map(String);
     if (patch.modelTierOverrides && typeof patch.modelTierOverrides === 'object') {
       s.modelTierOverrides = {};

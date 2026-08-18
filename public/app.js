@@ -202,8 +202,6 @@ async function sync(quiet = false) {
 function render() {
   const s = STATE;
   if (!s) return;
-  const alive = s.health?.alive ?? 0;
-  const enabled = s.accounts.filter((a) => a.enabled).length;
 
   $('#nc-accounts').textContent = s.accounts.length;
   $('#nc-keys').textContent = s.keys.length;
@@ -213,10 +211,12 @@ function render() {
   $('#m-browser').textContent = s.browser.available ? (s.browser.headless ? 'headless' : 'headful') : '关闭';
 
   const pill = $('#top-pill');
-  const lamp = s.accounts.length === 0 ? 'bad' : alive > 0 ? 'ok' : 'warn';
+  // 存活数优先看我们自己探到的状态（引擎观测只是补充），没探过的按"可用"算
+  const okCount = s.accounts.filter((a) => a.enabled && (!a.status || a.status.state === 'ok')).length;
+  const lamp = s.accounts.length === 0 ? 'bad' : okCount > 0 ? 'ok' : 'warn';
   pill.querySelector('.lamp').className = `lamp ${lamp}`;
   pill.querySelector('span').textContent =
-    s.accounts.length === 0 ? '号池为空' : `${alive || enabled}/${s.accounts.length} 号可用`;
+    s.accounts.length === 0 ? '号池为空' : `${okCount}/${s.accounts.length} 号可用`;
 
   renderNotice(s);
   renderOverview(s);
@@ -258,8 +258,8 @@ function renderOverview(s) {
     const local = at > 0 ? label.slice(0, at) : label;
     const host = at > 0 ? label.slice(at) : '';
     const state = a.status?.verdict || (a.enabled ? '未检测' : '已停用');
-    return `<div class="ch" data-off="${a.enabled ? 0 : 1}" title="${esc(a.status?.detail || '还没检测过')}">
-      <div class="ch-top"><i class="lamp ${lampFor(a)}"></i><span class="ch-role">${POOL_LABEL[a.pool] || ''}</span></div>
+    return `<div class="ch ${a.active ? 'is-active' : ''}" data-off="${a.enabled ? 0 : 1}" title="${esc(a.status?.detail || '还没检测过')}">
+      <div class="ch-top"><i class="lamp ${lampFor(a)}"></i>${a.active ? '<span class="ch-now">当前</span>' : ''}<span class="ch-role">${POOL_LABEL[a.pool] || ''}</span></div>
       <div class="ch-name" title="${esc(label)}">${esc(local)}</div>
       <div class="ch-host">${esc(host || '—')}</div>
       <div class="ch-state" title="${esc(state)}">${esc(state)}</div>
@@ -275,8 +275,12 @@ function renderOverview(s) {
 
   const freeCount = s.accounts.filter((a) => a.pool !== 'paid' && a.enabled).length;
   const calls = s.keys.reduce((n, k) => n + (k.requests || 0), 0);
+  const activeAcct = s.accounts.find((a) => a.active);
+  const mode = s.settings.autoSwitch === false ? '手动指定' : '用完才换';
   $('#pool-summary').textContent = s.accounts.length
-    ? `${s.accounts.length} 号 · ${freeCount} 个能跑免费模型 · 累计 ${calls} 次调用 · 引擎优先复用活跃 session`
+    ? `${s.accounts.length} 号 · ${freeCount} 个能跑免费模型 · 累计 ${calls} 次调用 · 切换策略：${mode}${
+        activeAcct ? ` · 当前 ${activeAcct.email || activeAcct.id}` : ''
+      }`
     : '空池 —— 先加一个号';
 
   // 上手三步（真实顺序，做完了就打勾）
@@ -306,7 +310,7 @@ function renderAccounts(s) {
       const tagClass = st ? (LAMP_BY_STATE[st.state] === 'ok' ? 'ok' : LAMP_BY_STATE[st.state] === 'bad' ? 'bad' : 'warn') : '';
       const label = st ? st.verdict : a.workerState ? `引擎观测 ${a.workerState.state}` : '未检测';
       return `<tr data-id="${a.id}" class="${a.enabled ? '' : 'is-off'}">
-      <td><div class="cell-main"><b>${esc(a.email || a.name || '未知邮箱')}</b>
+      <td><div class="cell-main"><b>${esc(a.email || a.name || '未知邮箱')}</b>${a.active ? ' <span class="tag now">当前</span>' : ''}
         <span class="cell-sub">${esc(a.source)} · ${ago(a.createdAt)}加入</span></div></td>
       <td><select class="inline js-pool" title="${esc(POOL_FULL[a.pool] || '')}">
         ${Object.entries(POOL_FULL)
@@ -318,6 +322,7 @@ function renderAccounts(s) {
       <td class="cell-mono">${esc(a.tokenMasked)}</td>
       <td class="acts">
         <button class="btn tiny js-check">检测</button>
+        <button class="btn tiny js-use"${a.active || !a.enabled ? ' disabled' : ''}>设为当前</button>
         <button class="btn tiny js-toggle">${a.enabled ? '停用' : '启用'}</button>
         <button class="btn tiny js-token">复制 token</button>
         <button class="btn tiny danger js-del">删除</button>
@@ -348,6 +353,15 @@ function renderAccounts(s) {
     $('.js-toggle', tr).addEventListener('click', async () => {
       await api(`/accounts/${id}`, { method: 'PATCH', body: { enabled: !acct.enabled } });
       sync(true);
+    });
+    $('.js-use', tr).addEventListener('click', async () => {
+      try {
+        await api(`/accounts/${id}/activate`, { method: 'POST' });
+        toast(`之后的请求都走 ${acct.email || id}`);
+        sync(true);
+      } catch (err) {
+        toast(err.message, 'err');
+      }
     });
     $('.js-token', tr).addEventListener('click', async () => {
       const r = await api(`/accounts/${id}`);
@@ -455,6 +469,29 @@ function renderModels(s) {
 }
 
 function renderSettings(s) {
+  const auto = s.settings.autoSwitch !== false;
+  $('#set-autoswitch').checked = auto;
+  const sel = $('#set-active');
+  const cur = s.settings.activeAccountId || '';
+  sel.innerHTML =
+    '<option value="">（自动挑一个可用的）</option>' +
+    s.accounts
+      .map(
+        (a) =>
+          `<option value="${a.id}"${a.id === cur ? ' selected' : ''}${a.enabled ? '' : ' disabled'}>${esc(
+            a.email || a.name || a.id
+          )}${a.enabled ? '' : '（已停用）'}</option>`
+      )
+      .join('');
+  const activeAcct = s.accounts.find((a) => a.id === cur);
+  $('#rotation-note').textContent = auto
+    ? activeAcct
+      ? `现在钉在 ${activeAcct.email || activeAcct.id} 上；它撞额度或者掉线了才会顺延到下一个号。`
+      : '还没钉住任何号：下一次请求会挑第一个可用的，之后就一直用它，直到它失败。'
+    : activeAcct
+      ? `只用 ${activeAcct.email || activeAcct.id}。它不可用时请求直接报错，不会偷偷换号。`
+      : '手动模式下必须指定一个账号，否则所有请求都会返回 503。';
+
   $('#set-allowpaid').checked = Boolean(s.settings.allowPaidDefault);
   $('#s-datadir').textContent = s.storage.dir;
   $('#s-persist').textContent = s.storage.persistent ? '持久' : '临时（重新部署会清空）';
@@ -559,6 +596,16 @@ $('#btn-model-refresh').addEventListener('click', async () => {
 $('#set-allowpaid').addEventListener('change', async (ev) => {
   await api('/settings', { method: 'PATCH', body: { allowPaidDefault: ev.target.checked } });
   toast('已保存');
+});
+$('#set-autoswitch').addEventListener('change', async (ev) => {
+  await api('/settings', { method: 'PATCH', body: { autoSwitch: ev.target.checked } });
+  toast(ev.target.checked ? '当前账号失败时会自动顺延到下一个号' : '已关闭自动切换：只用指定的那个号');
+  sync(true);
+});
+$('#set-active').addEventListener('change', async (ev) => {
+  await api('/settings', { method: 'PATCH', body: { activeAccountId: ev.target.value || null } });
+  toast(ev.target.value ? '已指定当前账号' : '已放开指定，下一次请求自己挑');
+  sync(true);
 });
 $('#btn-export').addEventListener('click', () => window.open('/admin/api/export', '_blank'));
 

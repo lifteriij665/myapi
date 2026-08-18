@@ -58,6 +58,7 @@ function accountView(acct, workerStates) {
     name: acct.name || '',
     pool: acct.pool || 'any',
     enabled: acct.enabled !== false,
+    active: store.settings.activeAccountId === acct.id,
     source: acct.source || 'manual',
     createdAt: acct.createdAt,
     lastUsedAt: acct.lastUsedAt,
@@ -225,7 +226,7 @@ export async function handleAdminApi(req, res, url) {
     return sendJson(res, 200, { ok: true, results });
   }
 
-  const acctMatch = path.match(/^\/accounts\/([\w-]+)(\/check)?$/);
+  const acctMatch = path.match(/^\/accounts\/([\w-]+)(\/check|\/activate)?$/);
   if (acctMatch) {
     const id = acctMatch[1];
     const acct = store.accounts.find((a) => a.id === id);
@@ -235,6 +236,11 @@ export async function handleAdminApi(req, res, url) {
       const result = await probeAccount(acct.token);
       store.setAccountStatus(id, result);
       return sendJson(res, 200, { ok: true, status: store.accounts.find((a) => a.id === id).status });
+    }
+    if (acctMatch[2] === '/activate' && method === 'POST') {
+      if (!acct.enabled) return sendJson(res, 400, { ok: false, error: '这个账号是停用状态，先启用再设为当前' });
+      store.setActiveAccount(id);
+      return sendJson(res, 200, { ok: true, activeAccountId: id });
     }
     if (method === 'PATCH') {
       const body = await readJson(req, 64 * 1024);
