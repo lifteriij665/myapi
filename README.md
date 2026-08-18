@@ -57,7 +57,17 @@
 
 不挂也能跑，但**每次重新部署账号池和 API key 都会清空**（Railway 容器文件系统是临时的）。控制台顶部会一直提示这件事。
 
-### 4. 开公网域名
+### 4. 选区域（别忘了这一步）
+
+服务 → **Settings** → **Scale** → **Regions & Replicas**，选一个**美国**区域（US West / US East）。
+
+freebuff 的免费模型对出口 IP 有美国限制，部在欧洲或亚洲区大概率拿到 `country_blocked`（控制台的账号状态会显示「地区受限」）。
+
+**副本数保持 1。** 挂了 Volume 的服务本来就不允许多副本；而且多副本各自维护自己的 session 缓存和登录流程状态，会重复创建 session 白烧额度、也会让「网页内登录」在轮询时打到另一个副本上失败。
+
+> `railway.json` 里**故意没有写** region 和 numReplicas —— 一旦写进去，面板上这两个控件就会被锁成「The value is set in /railway.json」，只能改文件重新部署。留在面板里改更方便。
+
+### 5. 开公网域名
 
 服务 → **Settings** → **Networking** → **Generate Domain**，拿到 `xxx.up.railway.app`。
 
