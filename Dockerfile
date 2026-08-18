@@ -8,16 +8,16 @@ ARG INSTALL_CHROMIUM=true
 
 ENV NODE_ENV=production \
     DATA_DIR=/data \
-    PORT=8787 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 WORKDIR /app
 
 # xvfb：给 patchright 提供真实 X11 显示，Chromium 以 headful 模式跑，指纹比 headless 干净得多
+# xauth：xvfb-run 硬依赖它（xvfb 只是 Recommends），留着方便进容器手动调试
 # tini：1 号进程，负责回收 chromium 子进程，避免僵尸进程堆积
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates tini xvfb fonts-liberation fonts-noto-core fonts-noto-color-emoji \
+      ca-certificates tini xvfb xauth fonts-liberation fonts-noto-core fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./

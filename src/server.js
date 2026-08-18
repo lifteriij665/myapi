@@ -127,13 +127,21 @@ async function requestHandler(req, res) {
 
 export function createApp() {
   ensureDirs();
-  store.load();
+  try {
+    store.load();
+  } catch (err) {
+    // 数据目录有问题也要把服务起起来：至少 /healthz 和控制台能回话，
+    // 用户才看得到"数据目录不可写"这种提示，而不是面对一个健康检查失败的部署。
+    console.error(`[myapi] 读取数据失败，先用内存里的空配置启动：${err.message}`);
+  }
 
   // 首次启动没设密码：生成一个随机密码打印到日志（Railway 面板里能看到）
   let generatedPassword = null;
   if (!store.hasPassword()) {
     generatedPassword = randomBytes(9).toString('base64url');
-    store.setPassword(generatedPassword);
+    try {
+      store.setPassword(generatedPassword);
+    } catch {}
     console.log('');
     console.log('==========================================================');
     console.log('  没有检测到 ADMIN_PASSWORD，已自动生成一个管理密码：');
@@ -195,8 +203,10 @@ const isMain = Boolean(process.argv[1]) && pathToFileURL(process.argv[1]).href =
 if (isMain || process.env.MYAPI_FORCE_START === '1') {
   const { server } = createApp();
 
-  server.listen(config.port, config.host, () => {
-    console.log(`[myapi] v${config.version} 已启动 → http://${config.host}:${config.port}`);
+  const ready = () => {
+    const addr = server.address();
+    const where = typeof addr === 'string' ? addr : `${addr.address}:${addr.port}`;
+    console.log(`[myapi] v${config.version} 已监听 ${where}`);
     console.log(`[myapi] 数据目录 ${config.dataDir}（${config.persistentData ? '持久' : '⚠️ 非持久，重新部署会清空'}）`);
     console.log(`[myapi] 账号 ${store.accounts.length} 个，API key ${store.keys.length} 个`);
     const feat = browserFeature();
@@ -207,7 +217,26 @@ if (isMain || process.env.MYAPI_FORCE_START === '1') {
       console.warn('[myapi] ⚠️ 没检测到 Railway Volume：账号和 key 在重新部署后会丢失，建议挂一个 Volume 到 /data');
     }
     refreshCatalog().catch(() => {});
-  });
+  };
+
+  // 先试 IPv6 双栈，不行再退 IPv4；两个都失败才退出（并把原因打清楚）
+  const bind = (host, isRetry = false) => {
+    const onError = (err) => {
+      if (!isRetry && host !== '0.0.0.0') {
+        console.warn(`[myapi] 绑定 [${host}]:${config.port} 失败（${err.code || err.message}），退回 0.0.0.0`);
+        bind('0.0.0.0', true);
+        return;
+      }
+      console.error(`[myapi] 监听 ${host}:${config.port} 失败：${err.code || err.message}`);
+      process.exit(1);
+    };
+    server.once('error', onError);
+    server.listen(config.port, host, () => {
+      server.removeListener('error', onError);
+      ready();
+    });
+  };
+  bind(config.host);
 
   const shutdown = async (signal) => {
     console.log(`[myapi] 收到 ${signal}，正在收尾…`);

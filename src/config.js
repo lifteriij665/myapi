@@ -41,7 +41,9 @@ const dataDir = resolveDataDir();
 
 export const config = {
   port: parseInt(process.env.PORT || '8787', 10),
-  host: process.env.HOST || '0.0.0.0',
+  // 默认绑 IPv6 通配地址：Linux 上是双栈，IPv4 也能进来（Railway 的内网是 IPv6，
+  // 只绑 0.0.0.0 有可能收不到内网流量）。绑不上会自动退回 0.0.0.0。
+  host: process.env.HOST || '::',
 
   adminPassword: (process.env.ADMIN_PASSWORD || '').trim(),
   sessionSecret: (process.env.SESSION_SECRET || '').trim(),

@@ -198,6 +198,17 @@ npm run check           # 语法/导入自检
 
 ## 七、常见问题
 
+**Railway 部署后 Healthcheck 一直失败（`service unavailable`）？**
+说明容器根本没起来，去 Deploy Logs 从上往下看第一条 `[entrypoint]` 之前有没有报错。启动脚本刻意不用 `set -e`，Xvfb 起不来也只会退化成 headless，不会拖垮服务；正常应该能看到这三行：
+
+```
+[entrypoint] Xvfb 就绪（DISPLAY=:99, pid=…）
+[entrypoint] node v22.x · PORT=… · DATA_DIR=/data
+[myapi] v1.0.0 已监听 :::8787
+```
+
+服务默认绑 `::`（IPv6 双栈，IPv4 也能进），绑不上会自动退回 `0.0.0.0`，两种情况日志里都会写清楚。
+
 **内置浏览器里 Google 登录被拒？**
 Google 对自动化浏览器有额外风控。patchright + headful(Xvfb) 已经把常见的自动化特征去掉了，但不保证 100%。遇到拒登直接换 **方式①**：在你自己的浏览器里授权，效果完全一样（token 是同一条链路拿到的）。GitHub 登录一般比 Google 顺利。
 
