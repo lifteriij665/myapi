@@ -13,9 +13,9 @@ import { config, ensureDirs } from './config.js';
 import { store } from './store.js';
 import { usage } from './usage.js';
 import { handleAdminApi, isAuthed } from './admin.js';
-import { handleApiRequest } from './engine.js';
+import { handleApiRequest, callWorker } from './engine.js';
 import { getSession, closeAllBrowsers, browserFeature } from './browser.js';
-import { refreshCatalog } from './models.js';
+import { refreshCatalog, noteEngineModelList } from './models.js';
 import { sendJson, sendText, publicBaseUrl } from './util.js';
 
 const MIME = {
@@ -246,7 +246,18 @@ if (isMain || process.env.MYAPI_FORCE_START === '1') {
     if (config.onRailway && !config.railwayVolume) {
       console.warn('[myapi] ⚠️ 没检测到 Railway Volume：账号和 key 在重新部署后会丢失，建议挂一个 Volume 到 /data');
     }
-    refreshCatalog().catch(() => {});
+    refreshCatalog()
+      .then(async () => {
+        // 预热：问一次引擎自己的模型列表，把"上游已暂停"的那些先标出来
+        try {
+          const resp = await callWorker('/v1/models');
+          const data = await resp.json();
+          const ids = Array.isArray(data?.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
+          const paused = noteEngineModelList(ids);
+          if (paused.size) console.log(`[myapi] 引擎已屏蔽的模型：${[...paused].join(', ')}`);
+        } catch {}
+      })
+      .catch(() => {});
   };
 
   // 先试 IPv6 双栈，不行再退 IPv4；两个都失败才退出（并把原因打清楚）

@@ -3,7 +3,7 @@
 // 防跨站：cookie 用 SameSite=Lax，另外对带 Origin 的写请求做同源校验。
 import { store } from './store.js';
 import { config } from './config.js';
-import { catalog, catalogMeta, refreshCatalog, tierOf, defaultModel } from './models.js';
+import { catalog, catalogMeta, refreshCatalog, tierOf, defaultModel, noteEngineModelList } from './models.js';
 import { callWorker, eligibleAccounts, workerHealth } from './engine.js';
 import { probeAccount } from './probe.js';
 import { startFlow, getFlow, cancelFlow, publicFlow } from './login-flow.js';
@@ -131,7 +131,10 @@ async function liveModelIds() {
   try {
     const resp = await callWorker('/v1/models');
     const data = await resp.json();
-    return Array.isArray(data?.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
+    const ids = Array.isArray(data?.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
+    // 引擎列表里缺的那些＝引擎按上游"已暂停"名单屏蔽掉的，同步给 models 层
+    noteEngineModelList(ids);
+    return ids;
   } catch {
     return [];
   }

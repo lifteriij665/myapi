@@ -1,7 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_MODEL = "mimo/mimo-v2.5";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.9";
+const VERSION = "1.8.10";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
@@ -304,6 +304,7 @@ function dynamicStandardModels() {
 // 模型池分类查询：动态池优先，硬编码兜底
 // 返回 "premium" | "standard" | "glm" | null
 function modelPoolCategory(modelId) {
+  if (isPausedModel(modelId)) return null; // 暂停模型不参与任何额度池归类
   const dyn = dynamicModelsCache;
   if (dyn && dyn.pool) {
     if (dyn.pool.premium.has(modelId)) return "premium";
@@ -361,6 +362,19 @@ const STANDARD_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
   "mimo/mimo-v2.5",
 ]);
+
+// ---------------------------------------------------------------------------
+// 官方暂停/不可用模型（2026-08-18 官方限免层暂停 DeepSeek V4 Flash）：
+// 不出现在模型列表；请求这些模型时显式返回 unsupported_model，不静默替换。
+// 需要扩展暂停名单时改这里（或后续接 env PAUSED_MODELS 覆盖）。
+// ---------------------------------------------------------------------------
+const PAUSED_MODELS = new Set([
+  "deepseek/deepseek-v4-flash",
+]);
+
+function isPausedModel(modelId) {
+  return PAUSED_MODELS.has(modelId);
+}
 
 // ---------------------------------------------------------------------------
 // 桌面版协议常量（逆向自 Freebuff Desktop orchestrator.js）
@@ -1214,6 +1228,7 @@ function findModelConfig(modelId) {
 // 查找模型配置前确保动态注册表已加载。
 // 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
 async function resolveModelConfig(modelId) {
+  if (isPausedModel(modelId)) return null; // 暂停模型 = 不可用，显式 unsupported_model
   let hit = findModelConfig(modelId);
   if (hit) return hit;
   try {
@@ -2114,6 +2129,8 @@ async function handleModels() {
       modelList = mergeModelTables(MODELS, dyn.models);
     }
   } catch {}
+  // 官方暂停模型不出现在列表（如限免暂停的 deepseek-v4-flash）
+  modelList = modelList.filter((m) => !isPausedModel(m.id));
   return jsonResponse({
     object: "list",
     data: modelList.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),

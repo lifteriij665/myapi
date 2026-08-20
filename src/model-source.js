@@ -63,6 +63,33 @@ function parseArrayConst(src, name, idMap, seen = new Set()) {
   return [...new Set(ids)];
 }
 
+/**
+ * 解析每个模型块里的展示信息：
+ *   const XXX_MODEL = { id: FREEBUFF_XXX_MODEL_ID, displayName: '…', availability: '…', premium: bool }
+ * availability = 'off_peak_only' 的行是按时段关的（Pro 在 UTC 00:00-10:00 不可用），
+ * 这种"表里有但现在调不通"的信息，正是模型列表最需要说清楚的东西。
+ */
+function parseModelDetails(src, idMap) {
+  const out = {};
+  for (const m of src.matchAll(/^const [A-Z0-9_]+_MODEL = \{([\s\S]*?)^\} as const/gm)) {
+    const body = m[1];
+    const idName = (body.match(/^\s*id:\s*([A-Z0-9_]+),/m) || [])[1];
+    const id = idName ? idMap[idName] : null;
+    if (!id) continue;
+    const detail = {
+      displayName: (body.match(/^\s*displayName:\s*'([^']+)'/m) || [])[1] || '',
+      availability: (body.match(/^\s*availability:\s*'([^']+)'/m) || [])[1] || '',
+      premium: /^\s*premium:\s*true/m.test(body),
+      multimodal: /^\s*multimodal:\s*true/m.test(body),
+    };
+    // 关闭时段写在 availability 上面的注释里，能捞到就一起给出来
+    const win = body.match(/Unavailable (\d{2}:\d{2})-(\d{2}:\d{2}) UTC/);
+    if (win) detail.closedWindowUtc = `${win[1]}-${win[2]}`;
+    out[id] = detail;
+  }
+  return out;
+}
+
 function parseNumberConst(src, name, dflt) {
   const m = src.match(new RegExp(`export const ${name}\\s*=\\s*(\\d+)`));
   return m ? Number(m[1]) : dflt;
@@ -133,8 +160,10 @@ export async function fetchOfficialTable() {
   // standard = 全集 - premium - glm（官方就是这么推导 WEB_STANDARD 的）
   const standard = new Set([...agents.keys()].filter((id) => !premium.has(id) && !glm.has(id)));
 
+  const details = parseModelDetails(modelsTs, idMap);
   return {
-    models: [...agents.entries()].map(([id, agent]) => ({ id, agent, session: id })),
+    models: [...agents.entries()].map(([id, agent]) => ({ id, agent, session: id, ...(details[id] || {}) })),
+    details,
     pools: { premium: [...premium], standard: [...standard], glm: [...glm] },
     limits: {
       premium: parseNumberConst(src, 'FREEBUFF_PREMIUM_SESSION_LIMIT', 6),

@@ -17,8 +17,9 @@ const RELEASE_SOURCES = [
   'https://cdn.jsdelivr.net/gh/pingmike2/freebuff2api-wokers@main/freebuff-models.json',
 ];
 const REFRESH_MS = 6 * 60 * 60 * 1000;
-// 与 worker.js 的 DEFAULT_MODEL 保持一致（客户端没指定模型时上游走它）
-export const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash';
+// 与 worker.js 的 DEFAULT_MODEL 保持一致（客户端没指定模型时上游走它）。
+// worker 1.8.10 起是 mimo/mimo-v2.5 —— flash 被上游挪进 premium 池之后不再适合当默认值。
+export const DEFAULT_MODEL = 'mimo/mimo-v2.5';
 
 /** 客户端传的模型名看起来是不是 Claude 系（Anthropic 客户端会发 claude-xxx，需要别名兜底） */
 export function looksLikeClaude(raw) {
@@ -41,7 +42,15 @@ function normalize(raw, source) {
   const models = new Map();
   for (const m of raw?.models || []) {
     if (!m?.id) continue;
-    models.set(m.id, { id: m.id, agent: m.agent || '', session: m.session || m.id });
+    models.set(m.id, {
+      id: m.id,
+      agent: m.agent || '',
+      session: m.session || m.id,
+      displayName: m.displayName || '',
+      availability: m.availability || '',
+      closedWindowUtc: m.closedWindowUtc || '',
+      multimodal: Boolean(m.multimodal),
+    });
   }
   // 池里出现但 models 里没有的 id 也补进来，保证分类查得到
   for (const id of [...premium, ...glm, ...standard]) {
@@ -148,6 +157,11 @@ export function noteOf(modelId) {
   if (isDeepSeekFamily(modelId) && table.premium.has(modelId)) {
     return `DeepSeek 家族：Flash 和 Pro 共用每天 ${lim.deepseek || 1} 次 session，而且这一次还照样扣 Premium 额度 —— 全池里最紧的`;
   }
+  const det = table.models.get(modelId);
+  if (det?.availability === 'off_peak_only') {
+    return `上游按时段关闭：UTC ${det.closedWindowUtc || '00:00-10:00'} 这段时间不可用（高峰期上游成本翻倍），其余时间照常`;
+  }
+  if (det?.availability === 'deployment_hours') return '上游只在部署时段开放';
   if (isLimitedOffer(modelId)) return '限量试用：上游放多少算多少，池子空了这个模型就整个消失';
   if (table.glm.has(modelId)) return '独立额度池，需 referral / streak 资格';
   if (!table.models.has(modelId)) return '未在上游模型表中，分类默认按付费处理';
@@ -218,7 +232,35 @@ export function learnFromQuotaSnapshot(rateLimits, limitedOffers) {
   }
 }
 
+/**
+ * 引擎（vendor/worker.js）自己也有一份"上游已暂停"名单，1.8.10 起它会把那些模型
+ * 从 /v1/models 里滤掉、请求时直接回 unsupported_model。
+ * 这里不重复维护那份名单 —— 直接对比"我的表里有、引擎列表里没有"，
+ * 这样以后 npm run update-worker 换了名单也自动跟上。
+ */
+const enginePaused = new Set();
+
+export function noteEngineModelList(liveIds) {
+  // 引擎拉不到动态表时只剩一个硬编码兜底模型，那种列表不能用来判断"被暂停"
+  if (!Array.isArray(liveIds) || liveIds.length < 3) return enginePaused;
+  const live = new Set(liveIds);
+  enginePaused.clear();
+  for (const id of table.models.keys()) if (!live.has(id)) enginePaused.add(id);
+  return enginePaused;
+}
+
+export function isEnginePaused(modelId) {
+  return enginePaused.has(modelId);
+}
+
 export function availabilityOf(modelId) {
+  if (enginePaused.has(modelId)) {
+    return {
+      state: 'paused',
+      detail: '引擎按上游"已暂停"名单屏蔽了它：不会出现在 /v1/models，请求会直接被拒（vendor/worker.js 的 PAUSED_MODELS）',
+      at: null,
+    };
+  }
   const st = store.modelStatus?.[modelId];
   if (!st) return { state: 'unverified', detail: '只在上游模型表里出现过，还没实测', at: null };
   return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
@@ -240,6 +282,9 @@ export function catalog(extraIds = []) {
       availability: availabilityOf(id),
       limitedOffer: isLimitedOffer(id),
       deepseekFamily: isDeepSeekFamily(id),
+      displayName: table.models.get(id)?.displayName || '',
+      upstreamAvailability: table.models.get(id)?.availability || '',
+      closedWindowUtc: table.models.get(id)?.closedWindowUtc || '',
     }))
     .sort((a, b) => (a.tier === b.tier ? a.id.localeCompare(b.id) : a.tier === 'free' ? -1 : 1));
 }
@@ -269,6 +314,7 @@ export function defaultModel() {
         !disabled.has(id) &&
         tierOf(id) === 'free' &&
         !isLimitedOffer(id) && // 限量试用随时会整个消失，不能当默认
+        !enginePaused.has(id) &&
         availabilityOf(id).state !== 'unavailable'
     )
     .sort();
@@ -277,6 +323,13 @@ export function defaultModel() {
 
 /** 某个 API key 能不能用这个模型 */
 export function checkModelAccess(keyRecord, modelId) {
+  if (modelId && enginePaused.has(modelId)) {
+    return {
+      ok: false,
+      status: 404,
+      message: `模型 ${modelId} 已被上游暂停提供（引擎 vendor/worker.js 的 PAUSED_MODELS 里有它），换一个模型；GET /v1/models 是当前真正能用的列表`,
+    };
+  }
   const disabled = new Set(store.settings?.disabledModels || []);
   if (modelId && disabled.has(modelId)) {
     return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
@@ -325,6 +378,7 @@ export function filterModelList(keyRecord, list) {
     if (!keyRecord?.allowPaid && tierOf(id) === 'paid') return false;
     // 实测过、确认上游按模型本身拒绝的，默认不再对外提供 ——
     // 客户端拿到一份"里面有一半调不通"的模型列表毫无用处
+    if (enginePaused.has(id)) return false;
     if (hideDead && availabilityOf(id).state === 'unavailable') return false;
     return true;
   });

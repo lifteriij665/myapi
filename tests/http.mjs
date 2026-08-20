@@ -248,5 +248,24 @@ check('全部清理清空账号并补一个新 Key', full.status === 200 && stat
 const stillLoggedIn = await admin('/session');
 check('全部清理之后还能登录（密码保留）', stillLoggedIn.json?.authed === true, JSON.stringify(stillLoggedIn.json));
 
+
+// ── 上游暂停的模型（worker 1.8.10 的 PAUSED_MODELS）──
+const st2 = await admin('/state');
+// 上面「全部清理」把 key 全删了并补了一个新的，module 级的 KEY 已经作废
+KEY = st2.json.keys[0].key;
+const paused = st2.json.models.filter((m) => m.availability?.state === 'paused').map((m) => m.id);
+check('能识别出引擎屏蔽的模型', paused.length > 0, `paused=${JSON.stringify(paused)}`);
+const liveIds = (await (await raw('/v1/models', { headers: { authorization: `Bearer ${KEY}` } })).json()).data.map((m) => m.id);
+check('被暂停的模型不出现在 /v1/models', paused.every((id) => !liveIds.includes(id)), JSON.stringify(liveIds));
+const pausedReq = await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: paused[0], messages: [{ role: 'user', content: 'x' }] }),
+});
+const pausedBody = await pausedReq.text();
+check('请求被暂停的模型给出明确原因', pausedReq.status === 404 && /暂停/.test(pausedBody), `${pausedReq.status} ${pausedBody.slice(0, 120)}`);
+check('默认模型不会是被暂停的那个', !paused.includes(st2.json.defaultModel), String(st2.json.defaultModel));
+check('引擎版本跟 vendor 一致', st2.json.workerVersion === '1.8.10', String(st2.json.workerVersion));
+
 console.log(`\n集成测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

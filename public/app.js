@@ -627,6 +627,7 @@ const AVAIL_LABEL = {
   metered: ['ok', '上游有额度记录'],
   suspect: ['warn', '失败过一次'],
   unavailable: ['bad', '实测不可用'],
+  paused: ['bad', '上游已暂停'],
   unverified: ['', '未验证'],
 };
 
@@ -635,18 +636,21 @@ function renderModels(s) {
   const list = s.models.filter((m) => {
     if (q && !m.id.toLowerCase().includes(q)) return false;
     if (modelFilter === 'all') return true;
-    if (modelFilter === 'dead') return m.availability?.state === 'unavailable';
+    if (modelFilter === 'dead') return ['unavailable', 'paused'].includes(m.availability?.state);
     return m.tier === modelFilter;
   });
-  const dead = s.models.filter((m) => m.availability?.state === 'unavailable').length;
-  $('#model-meta').textContent = `免费 ${s.modelStats.free} · 付费 ${s.modelStats.paid}${dead ? ` · 实测不可用 ${dead}` : ''}`;
+  const dead = s.models.filter((m) => ['unavailable', 'paused'].includes(m.availability?.state)).length;
+  $('#model-meta').textContent = `免费 ${s.modelStats.free} · 付费 ${s.modelStats.paid}${dead ? ` · 不可用 ${dead}` : ''} · 引擎 ${s.workerVersion || '?'}`;
   $('#model-table tbody').innerHTML = list.length
     ? list
         .map((m) => {
           const av = m.availability || { state: 'unverified' };
           const [cls, label] = AVAIL_LABEL[av.state] || AVAIL_LABEL.unverified;
           return `<tr data-id="${esc(m.id)}">
-      <td class="cell-mono" style="color:var(--text)">${esc(m.id)}${m.limitedOffer ? ' <span class="tag warn">限量</span>' : ''}</td>
+      <td><div class="cell-main"><b class="cell-mono" style="font-weight:400">${esc(m.id)}</b>
+        <span class="cell-sub">${esc(m.displayName || '—')}${m.limitedOffer ? ' · 限量试用' : ''}${
+          m.closedWindowUtc ? ` · UTC ${esc(m.closedWindowUtc)} 关闭` : ''
+        }</span></div></td>
       <td><select class="inline js-tier">
         <option value="free"${m.tier === 'free' ? ' selected' : ''}>免费</option>
         <option value="paid"${m.tier === 'paid' ? ' selected' : ''}>付费</option>
