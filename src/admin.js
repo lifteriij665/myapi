@@ -3,13 +3,17 @@
 // 防跨站：cookie 用 SameSite=Lax，另外对带 Origin 的写请求做同源校验。
 import { store } from './store.js';
 import { config } from './config.js';
-import { catalog, catalogMeta, refreshCatalog, tierOf } from './models.js';
+import { catalog, catalogMeta, refreshCatalog, tierOf, defaultModel } from './models.js';
 import { callWorker, eligibleAccounts, workerHealth } from './engine.js';
 import { probeAccount } from './probe.js';
 import { startFlow, getFlow, cancelFlow, publicFlow } from './login-flow.js';
 import { browserFeature, startBrowserForFlow, getSession } from './browser.js';
+import { usage } from './usage.js';
+import { chatLogStatus, chatLogFiles, recentChats, readChatLogFile, clearChatLog } from './chatlog.js';
+import { inspectStorage, cleanupPreview, runCleanup } from './maintenance.js';
 import {
   sendJson,
+  sendText,
   readJson,
   parseCookies,
   serializeCookie,
@@ -133,6 +137,36 @@ async function liveModelIds() {
   }
 }
 
+/** SSE 推送用的轻量快照：不碰上游、不遍历磁盘（chatLogStatus 内部有 10 秒缓存） */
+function liveSnapshot() {
+  const chat = chatLogStatus();
+  return {
+    at: nowIso(),
+    usage: {
+      totals: usage.data.totals,
+      today: usage.snapshot({ recentLimit: 0 }).today,
+      windows: {
+        m5: usage.windowStats(5 * 60_000),
+        h1: usage.bucketWindow(1),
+        h24: usage.bucketWindow(24),
+      },
+      recent: usage.recent(14),
+      eventsHeld: usage.events.length,
+    },
+    accounts: store.accounts.map((a) => ({
+      id: a.id,
+      email: a.email || '',
+      active: store.settings.activeAccountId === a.id,
+      enabled: a.enabled !== false,
+      state: a.status?.state || null,
+      verdict: a.status?.verdict || null,
+      quota: a.status?.quota || '',
+    })),
+    keys: store.keys.map((k) => ({ id: k.id, name: k.name, requests: k.requests || 0, lastUsedAt: k.lastUsedAt })),
+    chatlog: { enabled: chat.enabled, files: chat.files, bytes: chat.bytes, full: chat.full },
+  };
+}
+
 async function buildState(req) {
   const base = publicBaseUrl(req);
   let health = null;
@@ -165,6 +199,14 @@ async function buildState(req) {
     keys: store.keys.map(keyView),
     models,
     modelStats: { total: models.length, free: freeCount, paid: models.length - freeCount, ...catalogMeta() },
+    defaultModel: defaultModel(),
+    usageSummary: {
+      totals: usage.data.totals,
+      today: usage.snapshot({ recentLimit: 0 }).today,
+      h1: usage.bucketWindow(1),
+      eventsHeld: usage.events.length,
+    },
+    chatlog: chatLogStatus(),
     health: health
       ? {
           status: health.status,
@@ -453,6 +495,110 @@ export async function handleAdminApi(req, res, url) {
       reply: reply.slice(0, 500),
       raw: resp.status === 200 ? undefined : text.slice(0, 800),
     });
+  }
+
+  // --- 用量统计 ---
+  if (path === '/usage' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, usage: usage.snapshot({ recentLimit: 80 }) });
+  }
+
+  if (path === '/usage/reset' && method === 'POST') {
+    usage.reset();
+    for (const k of store.keys) k.requests = 0;
+    store.saveNow();
+    return sendJson(res, 200, { ok: true, note: '用量统计已清零' });
+  }
+
+  // 实时推送：控制台不用手动刷新（每 2 秒一帧，只带轻量数据）
+  if (path === '/events' && method === 'GET') {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-store',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    });
+    const push = () => {
+      if (res.writableEnded) return;
+      try {
+        res.write(`data: ${JSON.stringify(liveSnapshot())}\n\n`);
+      } catch {
+        /* 客户端断了，下面的 close 会清理 */
+      }
+    };
+    push();
+    const tick = setInterval(push, 2000);
+    const ping = setInterval(() => {
+      if (!res.writableEnded) res.write(': ping\n\n');
+    }, 25000);
+    res.on('close', () => {
+      clearInterval(tick);
+      clearInterval(ping);
+    });
+    return undefined;
+  }
+
+  // --- 聊天记录 ---
+  if (path === '/chatlog' && method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      status: chatLogStatus(),
+      files: chatLogFiles(),
+      recent: recentChats(30),
+    });
+  }
+
+  if (path === '/chatlog/clear' && method === 'POST') {
+    const r = clearChatLog();
+    return sendJson(res, 200, { ok: true, ...r, note: `已删除 ${r.removed} 个记录文件` });
+  }
+
+  const chatFileMatch = path.match(/^\/chatlog\/file\/(chat-\d{4}-\d{2}-\d{2}\.jsonl)$/);
+  if (chatFileMatch && method === 'GET') {
+    const text = readChatLogFile(chatFileMatch[1]);
+    if (text === null) return sendJson(res, 404, { ok: false, error: '文件不存在或过大' });
+    return sendText(res, 200, text, 'application/x-ndjson; charset=utf-8', {
+      'content-disposition': `attachment; filename="${chatFileMatch[1]}"`,
+      'cross-origin-resource-policy': 'same-origin',
+    });
+  }
+
+  // --- 存储 / 清理 ---
+  if (path === '/storage' && method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      storage: inspectStorage(),
+      previews: {
+        routine: cleanupPreview('routine'),
+        deep: cleanupPreview('deep'),
+        full: cleanupPreview('full'),
+      },
+    });
+  }
+
+  if (path === '/cleanup' && method === 'POST') {
+    const body = await readJson(req, 8 * 1024);
+    const level = String(body.level || '');
+    if (!['routine', 'deep', 'full'].includes(level)) {
+      return sendJson(res, 400, { ok: false, error: '级别只能是 routine / deep / full' });
+    }
+    // full 会把账号和 key 都删掉，要求前端显式带确认标记，避免误点
+    if (level === 'full' && body.confirm !== 'DELETE') {
+      return sendJson(res, 400, { ok: false, error: '全部清理需要带 confirm="DELETE"' });
+    }
+    try {
+      const result = await runCleanup(level);
+      console.warn(`[maintenance] 执行了「${result.label}」：${result.done.join('、')}`);
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (err) {
+      return sendJson(res, err.statusCode || 500, { ok: false, error: err.message });
+    }
+  }
+
+  const modelStatusMatch = path.match(/^\/models\/status\/reset$/);
+  if (modelStatusMatch && method === 'POST') {
+    const body = await readJson(req, 8 * 1024);
+    store.clearModelStatus(body.id ? String(body.id) : null);
+    return sendJson(res, 200, { ok: true });
   }
 
   // ADMIN_ROUTES_MARKER

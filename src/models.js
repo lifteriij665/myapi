@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { ROOT } from './config.js';
 import { store } from './store.js';
+import { fetchOfficialTable } from './model-source.js';
 
 const RELEASE_SOURCES = [
   'https://github.com/pingmike2/freebuff2api-wokers/releases/latest/download/freebuff-models.json',
@@ -59,7 +60,17 @@ function normalize(raw, source) {
       }
     }
   }
-  return { premium, glm, standard, models, source, generatedAt: raw?.generatedAt || null };
+  return {
+    premium,
+    glm,
+    standard,
+    models,
+    source,
+    generatedAt: raw?.generatedAt || null,
+    limits: { premium: 4, standard: 6, deepseek: 0, ...(raw?.limits || {}) },
+    limitedOffer: new Set(raw?.limitedOffer || []),
+    deepseekFamily: new Set(raw?.deepseekFamily || []),
+  };
 }
 
 /** 后台刷新模型表；失败静默保留旧表 */
@@ -67,6 +78,17 @@ export async function refreshCatalog(force = false) {
   if (!force && Date.now() - lastRefresh < REFRESH_MS) return table;
   if (refreshing) return refreshing;
   refreshing = (async () => {
+    // 先试官方常量源码：它是第三方那份 JSON 的上游，没有"等人生成"的延迟
+    try {
+      const official = await fetchOfficialTable();
+      if (official) {
+        table = normalize(official, 'official');
+        lastRefresh = Date.now();
+        return table;
+      }
+    } catch (err) {
+      console.warn(`[models] 官方常量源解析失败，回落到 release JSON：${err.message}`);
+    }
     for (const url of RELEASE_SOURCES) {
       try {
         const ctrl = new AbortController();
@@ -106,11 +128,100 @@ export function isKnownModel(modelId) {
   return table.models.has(modelId);
 }
 
+/**
+ * 上游对 DeepSeek 家族（Flash + Pro）另外压了一道天花板：
+ * 两个 id **共用**每天 1 次 session，而且这一次还照样扣 premium 池的额度
+ * （官方常量 FREEBUFF_DEEPSEEK_SESSION_LIMIT = 1，注释写明"合用一份配额，
+ * 免得来回换 id 就白拿两次"）。所以它比普通 premium 模型更紧张。
+ */
+export function isDeepSeekFamily(modelId) {
+  if (table.deepseekFamily?.size) return table.deepseekFamily.has(modelId);
+  return /^deepseek\//i.test(String(modelId || ''));
+}
+
+export function isLimitedOffer(modelId) {
+  return Boolean(table.limitedOffer?.has(modelId));
+}
+
 export function noteOf(modelId) {
+  const lim = table.limits || {};
+  if (isDeepSeekFamily(modelId) && table.premium.has(modelId)) {
+    return `DeepSeek 家族：Flash 和 Pro 共用每天 ${lim.deepseek || 1} 次 session，而且这一次还照样扣 Premium 额度 —— 全池里最紧的`;
+  }
+  if (isLimitedOffer(modelId)) return '限量试用：上游放多少算多少，池子空了这个模型就整个消失';
   if (table.glm.has(modelId)) return '独立额度池，需 referral / streak 资格';
   if (!table.models.has(modelId)) return '未在上游模型表中，分类默认按付费处理';
-  if (table.premium.has(modelId)) return 'Premium 池：全账号共享 6 次 session/天';
-  return '非 Premium 模型（Flash / MiMo 一类）';
+  if (table.premium.has(modelId)) return `Premium 池：全账号共享 ${lim.premium || 4} 次 session/天`;
+  return '非 Premium：这一档目前不限量（上游随时会调）';
+}
+
+/**
+ * 上游模型表只说"官方有这个模型"，不代表你这些号现在真能用它。
+ * 所以再叠一层实测状态，来源有三个（可信度从高到低）：
+ *   1. 真实请求成功 / 因模型本身失败（unsupported_model、session_model_mismatch…）
+ *   2. 0 消耗探活拿到的 rateLimitsByModel 快照（上游确实给这个号计量这个模型）
+ *   3. 什么都没有 —— 只在表里，未验证
+ * 只有模型自身的失败才会标不可用；429、token 失效这类是账号问题，不算模型的错。
+ */
+const MODEL_FAIL_RE = /unsupported_model|model not available|model_not_found|session_model_mismatch|no such model|not supported|invalid model|use the paid|paid slug/i;
+
+/** 这次失败是"模型不行"还是"账号不行"？只有前者才该记到模型头上 */
+export function isModelSpecificFailure(status, text) {
+  const t = String(text || '');
+  if (status === 429 || status === 401 || status === 403) return false;
+  return MODEL_FAIL_RE.test(t);
+}
+
+/** 真实请求的结果回写到模型状态；连续 2 次模型级失败才判不可用 */
+export function recordModelResult(modelId, { ok, status, text } = {}) {
+  if (!modelId) return;
+  if (ok) {
+    const cur = store.modelStatus[modelId];
+    if (!cur || cur.state !== 'ok' || cur.fails) {
+      store.setModelStatus(modelId, { state: 'ok', detail: '实测调用成功', fails: 0, source: 'request' });
+    }
+    return;
+  }
+  if (!isModelSpecificFailure(status, text)) return;
+  const cur = store.modelStatus[modelId] || { fails: 0 };
+  const fails = (cur.fails || 0) + 1;
+  store.setModelStatus(modelId, {
+    state: fails >= 2 ? 'unavailable' : cur.state === 'ok' ? 'ok' : 'suspect',
+    detail: `上游按模型本身拒绝（HTTP ${status}）：${String(text).slice(0, 160)}`,
+    fails,
+    source: 'request',
+  });
+}
+
+/** 从 0 消耗探活的额度快照里学：出现在 rateLimitsByModel 里的模型 = 上游确实给这个号计量它 */
+export function learnFromQuotaSnapshot(rateLimits, limitedOffers) {
+  if (rateLimits && typeof rateLimits === 'object') {
+    for (const [key, info] of Object.entries(rateLimits)) {
+      if (!table.models.has(key)) continue; // 池名（premium/standard）不是模型，跳过
+      const cur = store.modelStatus[key];
+      if (cur?.state === 'ok' && !cur.fails) continue;
+      const used = info?.recentCount;
+      const limit = info?.limit;
+      store.setModelStatus(key, {
+        state: 'metered',
+        detail: `上游额度快照里有它${used != null && limit != null ? `（已用 ${used}/${limit}）` : ''}`,
+        fails: 0,
+        source: 'probe',
+      });
+    }
+  }
+  for (const offer of Array.isArray(limitedOffers) ? limitedOffers : []) {
+    const id = typeof offer === 'string' ? offer : offer?.modelId || offer?.model;
+    if (id && table.models.has(id)) {
+      store.setModelStatus(id, { state: 'metered', detail: '上游当前正在放这个限量试用', fails: 0, source: 'probe' });
+    }
+  }
+}
+
+export function availabilityOf(modelId) {
+  const st = store.modelStatus?.[modelId];
+  if (!st) return { state: 'unverified', detail: '只在上游模型表里出现过，还没实测', at: null };
+  return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
 }
 
 /** 控制台用的完整目录（可传入 worker /v1/models 返回的 id 列表做合并） */
@@ -126,12 +237,42 @@ export function catalog(extraIds = []) {
       agent: table.models.get(id)?.agent || '',
       enabled: !disabled.has(id),
       overridden: Boolean(store.settings?.modelTierOverrides?.[id]),
+      availability: availabilityOf(id),
+      limitedOffer: isLimitedOffer(id),
+      deepseekFamily: isDeepSeekFamily(id),
     }))
     .sort((a, b) => (a.tier === b.tier ? a.id.localeCompare(b.id) : a.tier === 'free' ? -1 : 1));
 }
 
 export function catalogMeta() {
-  return { source: table.source, generatedAt: table.generatedAt, lastRefresh, count: table.models.size };
+  return {
+    source: table.source,
+    generatedAt: table.generatedAt,
+    lastRefresh,
+    count: table.models.size,
+    limits: table.limits || null,
+  };
+}
+
+/**
+ * 客户端没写 model 时用哪个。默认挑当前 standard 池里的第一个（也就是"不限量"那一档），
+ * 而不是死写 flash —— 上游 2026-08-18 把 flash 挪进 premium 池之后，
+ * 死写 flash 会让每个不带 model 的请求都去啃每天 1 次的 DeepSeek 额度。
+ */
+export function defaultModel() {
+  const configured = store.settings?.defaultModel;
+  if (configured && table.models.has(configured)) return configured;
+  const disabled = new Set(store.settings?.disabledModels || []);
+  const free = [...table.standard]
+    .filter(
+      (id) =>
+        !disabled.has(id) &&
+        tierOf(id) === 'free' &&
+        !isLimitedOffer(id) && // 限量试用随时会整个消失，不能当默认
+        availabilityOf(id).state !== 'unavailable'
+    )
+    .sort();
+  return free[0] || DEFAULT_MODEL;
 }
 
 /** 某个 API key 能不能用这个模型 */
@@ -172,15 +313,19 @@ export function resolveModelId(raw, isAnthropic = false) {
   return isAnthropic ? DEFAULT_MODEL : value;
 }
 
-/** 过滤 /v1/models 返回值：按 key 的权限 + 下架列表 */
+/** 过滤 /v1/models 返回值：按 key 的权限 + 下架列表 + 实测不可用 */
 export function filterModelList(keyRecord, list) {
   const disabled = new Set(store.settings?.disabledModels || []);
   const allow = keyRecord?.models?.length ? new Set(keyRecord.models) : null;
+  const hideDead = store.settings?.hideUnavailableModels !== false;
   return list.filter((m) => {
     const id = m?.id;
     if (!id || disabled.has(id)) return false;
     if (allow && !allow.has(id)) return false;
     if (!keyRecord?.allowPaid && tierOf(id) === 'paid') return false;
+    // 实测过、确认上游按模型本身拒绝的，默认不再对外提供 ——
+    // 客户端拿到一份"里面有一半调不通"的模型列表毫无用处
+    if (hideDead && availabilityOf(id).state === 'unavailable') return false;
     return true;
   });
 }

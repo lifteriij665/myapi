@@ -28,7 +28,17 @@ function emptyData() {
       // activeAccountId 指定的那个号，失败也不自动换。
       autoSwitch: true,
       activeAccountId: null,
+      // 模型列表：把实测确认不可用的模型从 /v1/models 里藏掉
+      hideUnavailableModels: true,
+      // 客户端不写 model 时用哪个；留空＝自动挑当前不限量的那一档
+      defaultModel: '',
+      // 聊天记录留存（默认关）
+      chatLogEnabled: false,
+      chatLogMaxMB: 200,
+      chatLogMaxRecordKB: 256,
     },
+    // 模型实测状态：id -> { state, at, detail, fails }
+    modelStatus: {},
     accounts: [],
     keys: [],
   };
@@ -54,6 +64,7 @@ class Store {
         this.data.settings = { ...emptyData().settings, ...(parsed.settings || {}) };
         this.data.accounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
         this.data.keys = Array.isArray(parsed.keys) ? parsed.keys : [];
+        this.data.modelStatus = parsed.modelStatus && typeof parsed.modelStatus === 'object' ? parsed.modelStatus : {};
       } catch (err) {
         console.error(`[store] 数据文件损坏，已改名备份后重建: ${err.message}`);
         try {
@@ -369,6 +380,28 @@ class Store {
     this.save();
   }
 
+  // --- 模型实测状态 -----------------------------------------------------
+
+  get modelStatus() {
+    if (!this.data.modelStatus || typeof this.data.modelStatus !== 'object') this.data.modelStatus = {};
+    return this.data.modelStatus;
+  }
+
+  setModelStatus(id, patch) {
+    if (!id) return null;
+    const cur = this.modelStatus[id] || { fails: 0 };
+    const next = { ...cur, ...patch, at: nowIso() };
+    this.modelStatus[id] = next;
+    this.save();
+    return next;
+  }
+
+  clearModelStatus(id) {
+    if (id) delete this.modelStatus[id];
+    else this.data.modelStatus = {};
+    this.save();
+  }
+
   // --- 设置 -------------------------------------------------------------
 
   get settings() {
@@ -380,6 +413,17 @@ class Store {
     if ('allowPaidDefault' in patch) s.allowPaidDefault = Boolean(patch.allowPaidDefault);
     if ('browserLoginEnabled' in patch) s.browserLoginEnabled = Boolean(patch.browserLoginEnabled);
     if ('autoSwitch' in patch) s.autoSwitch = Boolean(patch.autoSwitch);
+    if ('hideUnavailableModels' in patch) s.hideUnavailableModels = Boolean(patch.hideUnavailableModels);
+    if ('defaultModel' in patch) s.defaultModel = String(patch.defaultModel || '').trim();
+    if ('chatLogEnabled' in patch) s.chatLogEnabled = Boolean(patch.chatLogEnabled);
+    if ('chatLogMaxMB' in patch) {
+      const n = Number(patch.chatLogMaxMB);
+      if (Number.isFinite(n) && n > 0 && n <= 100000) s.chatLogMaxMB = Math.floor(n);
+    }
+    if ('chatLogMaxRecordKB' in patch) {
+      const n = Number(patch.chatLogMaxRecordKB);
+      if (Number.isFinite(n) && n >= 4 && n <= 8192) s.chatLogMaxRecordKB = Math.floor(n);
+    }
     if ('activeAccountId' in patch) {
       const id = patch.activeAccountId ? String(patch.activeAccountId) : null;
       s.activeAccountId = id && this.data.accounts.some((a) => a.id === id) ? id : null;

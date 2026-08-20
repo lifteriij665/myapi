@@ -111,6 +111,7 @@ function lampFor(acct) {
 function lock(hint) {
   clearInterval(syncTimer);
   clearInterval(clockTimer);
+  disconnectLive();
   $('#shell').classList.add('hidden');
   $('#gate').classList.remove('hidden');
   if (hint) $('#gate-hint').textContent = hint;
@@ -125,6 +126,7 @@ async function unlock() {
   syncTimer = setInterval(() => sync(true), 20000);
   clearInterval(clockTimer);
   clockTimer = setInterval(paintSynced, 5000);
+  connectLive();
 }
 
 $('#gate-form').addEventListener('submit', async (ev) => {
@@ -151,7 +153,30 @@ $('#btn-logout').addEventListener('click', async () => {
 });
 
 // ─────────────────────────────────────────────── 视图切换
-const VIEW_TITLE = { overview: '概览', accounts: '账号池', keys: 'API Key', models: '模型', settings: '设置' };
+const VIEW_TITLE = { overview: '概览', usage: '用量', accounts: '账号池', keys: 'API Key', models: '模型', settings: '设置' };
+
+/** 数字/字节/时长的统一格式化 —— 表格里全是等宽数字，别让单位到处不一样 */
+const fmtInt = (n) => Number(n || 0).toLocaleString('zh-CN');
+const fmtCompact = (n) => {
+  const v = Number(n || 0);
+  if (v < 1000) return String(v);
+  if (v < 1e6) return (v / 1000).toFixed(v < 1e4 ? 1 : 0) + 'k';
+  if (v < 1e9) return (v / 1e6).toFixed(1) + 'M';
+  return (v / 1e9).toFixed(1) + 'B';
+};
+const fmtBytes = (n) => {
+  const v = Number(n || 0);
+  if (v < 1024) return `${v} B`;
+  if (v < 1048576) return `${(v / 1024).toFixed(1)} KB`;
+  if (v < 1073741824) return `${(v / 1048576).toFixed(1)} MB`;
+  return `${(v / 1073741824).toFixed(2)} GB`;
+};
+const fmtMs = (n) => {
+  const v = Math.round(Number(n || 0));
+  if (!v) return '—';
+  return v < 1000 ? `${v}ms` : `${(v / 1000).toFixed(v < 10000 ? 2 : 1)}s`;
+};
+const clock = (iso) => new Date(iso).toLocaleTimeString('zh-CN', { hour12: false });
 
 function show(view) {
   VIEW = view;
@@ -160,6 +185,8 @@ function show(view) {
   $('#view-title').textContent = VIEW_TITLE[view] || view;
   if (location.hash.slice(1) !== view) history.replaceState(null, '', `#${view}`);
   window.scrollTo({ top: 0 });
+  if (view === 'usage') loadUsage();
+  if (view === 'settings') loadStorage();
 }
 
 $('#nav').addEventListener('click', (ev) => {
@@ -171,6 +198,172 @@ window.addEventListener('hashchange', () => {
   if (VIEW_TITLE[v] && v !== VIEW) show(v);
 });
 
+// ─────────────────────────────────────────────── 用量
+let USAGE = null; // 完整快照（含 48 小时/30 天序列），进这个视图时拉一次
+let LIVE = null; // SSE 推来的轻量数据
+
+function renderUsageTiles() {
+  const live = LIVE?.usage || USAGE || null;
+  if (!live) return;
+  const w = live.windows || {};
+  const totals = live.totals || {};
+  const today = live.today || {};
+  const m5 = w.m5 || {};
+  const h1 = w.h1 || {};
+  const h24 = w.h24 || {};
+  const tokens = (b) => (b.inputTokens || 0) + (b.outputTokens || 0);
+  const avg = (b) => (b.requests ? b.latencySumMs / b.requests : 0);
+  const failRate = (b) => (b.requests ? Math.round((b.failed / b.requests) * 100) : 0);
+  const tiles = [
+    { label: '5 分钟', value: fmtInt(m5.requests), sub: `${(m5.rpm || 0).toFixed(1)} 次/分 · p95 ${fmtMs(m5.p95)}`, cls: m5.requests ? 'accent' : '' },
+    { label: '本小时', value: fmtInt(h1.requests), sub: `token ${fmtCompact(tokens(h1))} · 均 ${fmtMs(avg(h1))}` },
+    { label: '24 小时', value: fmtInt(h24.requests), sub: `token ${fmtCompact(tokens(h24))} · 失败 ${failRate(h24)}%`, cls: failRate(h24) > 20 ? 'warn' : '' },
+    { label: '今天', value: fmtInt(today.requests), sub: `成功 ${fmtInt(today.ok)} · 失败 ${fmtInt(today.failed)}`, cls: failRate(today) > 20 ? 'warn' : '' },
+    { label: '累计请求', value: fmtCompact(totals.requests), sub: `失败率 ${failRate(totals)}%` },
+    { label: '累计 token', value: fmtCompact(tokens(totals)), sub: `入 ${fmtCompact(totals.inputTokens)} / 出 ${fmtCompact(totals.outputTokens)}` },
+    { label: '流式占比', value: totals.requests ? `${Math.round((totals.streamed / totals.requests) * 100)}%` : '—', sub: `估算 token ${fmtInt(totals.estimated)} 条` },
+    { label: '最慢一次', value: fmtMs(totals.latencyMaxMs), sub: `平均 ${fmtMs(avg(totals))}` },
+  ];
+  $('#usage-tiles').innerHTML = tiles
+    .map(
+      (t) => `<div class="ro ${t.cls || ''}"><div class="ro-label">${esc(t.label)}</div>
+      <div class="ro-value">${esc(t.value)}</div><div class="ro-sub">${esc(t.sub)}</div></div>`
+    )
+    .join('');
+}
+
+function renderUsageBars() {
+  if (!USAGE?.hours?.length) return;
+  const hours = USAGE.hours;
+  const max = Math.max(1, ...hours.map((h) => h.requests));
+  $('#usage-bars').innerHTML =
+    hours
+      .map((h) => {
+        const okH = Math.round(((h.requests - h.failed) / max) * 88);
+        const badH = Math.round((h.failed / max) * 88);
+        const label = `${h.key.slice(11)}:00 · ${h.requests} 次${h.failed ? `（失败 ${h.failed}）` : ''} · token ${(h.inputTokens || 0) + (h.outputTokens || 0)}`;
+        if (!h.requests) return `<div class="bar empty" title="${esc(label)}"></div>`;
+        return `<div class="bar ${h.failed ? 'has-fail' : ''}" title="${esc(label)}">
+          ${badH ? `<em style="height:${badH}px"></em>` : ''}<i style="height:${Math.max(1, okH)}px"></i></div>`;
+      })
+      .join('') ;
+  const first = hours[0]?.key?.slice(11);
+  const last = hours[hours.length - 1]?.key?.slice(11);
+  $('#usage-bars-note').textContent = `${first}:00 → ${last}:00 · 峰值 ${max} 次/小时`;
+}
+
+function renderUsageTables() {
+  if (!USAGE) return;
+  const rows = USAGE.byModel || [];
+  $('#usage-model-table tbody').innerHTML = rows.length
+    ? rows
+        .map(
+          (m) => `<tr><td class="cell-mono">${esc(m.id)}</td>
+      <td class="right cell-mono">${fmtInt(m.requests)}</td>
+      <td class="right cell-mono">${fmtCompact(m.inputTokens)}</td>
+      <td class="right cell-mono">${fmtCompact(m.outputTokens)}</td>
+      <td class="right cell-mono">${fmtMs(m.requests ? m.latencySumMs / m.requests : 0)}</td></tr>`
+        )
+        .join('')
+    : '<tr><td colspan="5" class="muted" style="padding:18px;text-align:center">还没有数据</td></tr>';
+
+  const keyRows = (USAGE.byKey || []).map((k) => ({
+    ...k,
+    label: STATE?.keys.find((x) => x.id === k.id)?.name || k.id,
+    kind: 'Key',
+  }));
+  const acctRows = (USAGE.byAccount || []).map((a) => ({
+    ...a,
+    label: STATE?.accounts.find((x) => x.id === a.id)?.email || a.id,
+    kind: '账号',
+  }));
+  const merged = [...keyRows, ...acctRows];
+  $('#usage-key-table tbody').innerHTML = merged.length
+    ? merged
+        .map(
+          (r) => `<tr><td><span class="tag">${esc(r.kind)}</span> ${esc(r.label)}</td>
+      <td class="right cell-mono">${fmtInt(r.requests)}</td>
+      <td class="right cell-mono">${r.failed ? `<span style="color:var(--alarm)">${fmtInt(r.failed)}</span>` : '0'}</td>
+      <td class="right cell-mono">${fmtCompact((r.inputTokens || 0) + (r.outputTokens || 0))}</td></tr>`
+        )
+        .join('')
+    : '<tr><td colspan="4" class="muted" style="padding:18px;text-align:center">还没有数据</td></tr>';
+}
+
+function renderUsageFeed() {
+  const list = (LIVE?.usage?.recent?.length ? LIVE.usage.recent : USAGE?.recent) || [];
+  $('#usage-blank').classList.toggle('hidden', list.length > 0);
+  $('#usage-feed').classList.toggle('hidden', list.length === 0);
+  $('#usage-feed tbody').innerHTML = list
+    .map((e) => {
+      const keyName = STATE?.keys.find((k) => k.id === e.keyId)?.name || e.keyId || '—';
+      const cls = e.ok ? 'ok' : 'bad';
+      const io = e.usage ? `${fmtCompact(e.usage.input)}/${fmtCompact(e.usage.output)}${e.usage.estimated ? '*' : ''}` : '—';
+      return `<tr><td class="cell-mono">${clock(e.ts)}</td>
+      <td class="cell-mono">${esc(e.model || '—')}${e.stream ? ' <span class="tag">流</span>' : ''}</td>
+      <td>${esc(keyName)}</td>
+      <td><span class="tag ${cls}">${e.ok ? e.status : `${e.status} ${esc(String(e.error || '').slice(0, 18))}`}</span></td>
+      <td class="right cell-mono">${fmtMs(e.latencyMs)}</td>
+      <td class="right cell-mono">${e.ttfbMs ? fmtMs(e.ttfbMs) : '—'}</td>
+      <td class="right cell-mono">${io}</td></tr>`;
+    })
+    .join('');
+  const held = LIVE?.usage?.eventsHeld ?? USAGE?.eventsHeld ?? 0;
+  $('#feed-note').textContent = `内存里保留最近 ${held} 条明细（上限 ${USAGE?.eventCap || 3000}，重启清空；长期统计在上面的分布里）`;
+}
+
+async function loadUsage() {
+  try {
+    USAGE = (await api('/usage')).usage;
+    renderUsageTiles();
+    renderUsageBars();
+    renderUsageTables();
+    renderUsageFeed();
+  } catch (err) {
+    toast(`用量数据加载失败：${err.message}`, 'err');
+  }
+}
+
+$('#btn-usage-reset').addEventListener('click', async () => {
+  if (!confirm('把用量统计清零？聊天记录和账号不受影响。')) return;
+  try {
+    await api('/usage/reset', { method: 'POST' });
+    toast('用量统计已清零');
+    await loadUsage();
+    sync(true);
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+});
+
+// ─────────────────────────────────────────────── SSE 实时推送
+let sse = null;
+function connectLive() {
+  if (sse) return;
+  sse = new EventSource('/admin/api/events');
+  sse.onmessage = (ev) => {
+    try {
+      LIVE = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    $('#usage-live-note').textContent = `实时连接正常 · ${clock(LIVE.at)}`;
+    $('#nc-usage').textContent = fmtCompact(LIVE.usage?.totals?.requests || 0);
+    if (VIEW === 'usage') {
+      renderUsageTiles();
+      renderUsageFeed();
+    }
+  };
+  sse.onerror = () => {
+    $('#usage-live-note').textContent = '实时连接断了，正在重连…';
+  };
+}
+function disconnectLive() {
+  try {
+    sse?.close();
+  } catch {}
+  sse = null;
+}
 // ─────────────────────────────────────────────── 同步 + 渲染
 $('#btn-sync').addEventListener('click', () => sync());
 
@@ -218,6 +411,7 @@ function render() {
   pill.querySelector('span').textContent =
     s.accounts.length === 0 ? '号池为空' : `${okCount}/${s.accounts.length} 号可用`;
 
+  $('#nc-usage').textContent = fmtCompact(s.usageSummary?.totals?.requests || 0);
   renderNotice(s);
   renderOverview(s);
   renderAccounts(s);
@@ -428,28 +622,43 @@ function renderKeys(s) {
 
 let modelFilter = 'all';
 
+const AVAIL_LABEL = {
+  ok: ['ok', '实测可用'],
+  metered: ['ok', '上游有额度记录'],
+  suspect: ['warn', '失败过一次'],
+  unavailable: ['bad', '实测不可用'],
+  unverified: ['', '未验证'],
+};
+
 function renderModels(s) {
   const q = ($('#model-search').value || '').trim().toLowerCase();
-  const list = s.models.filter(
-    (m) => (modelFilter === 'all' || m.tier === modelFilter) && (!q || m.id.toLowerCase().includes(q))
-  );
-  $('#model-meta').textContent = `免费 ${s.modelStats.free} · 付费 ${s.modelStats.paid} · 来源 ${s.modelStats.source}`;
+  const list = s.models.filter((m) => {
+    if (q && !m.id.toLowerCase().includes(q)) return false;
+    if (modelFilter === 'all') return true;
+    if (modelFilter === 'dead') return m.availability?.state === 'unavailable';
+    return m.tier === modelFilter;
+  });
+  const dead = s.models.filter((m) => m.availability?.state === 'unavailable').length;
+  $('#model-meta').textContent = `免费 ${s.modelStats.free} · 付费 ${s.modelStats.paid}${dead ? ` · 实测不可用 ${dead}` : ''}`;
   $('#model-table tbody').innerHTML = list.length
     ? list
-        .map(
-          (m) => `<tr data-id="${esc(m.id)}">
-      <td class="cell-mono" style="color:var(--text)">${esc(m.id)}</td>
+        .map((m) => {
+          const av = m.availability || { state: 'unverified' };
+          const [cls, label] = AVAIL_LABEL[av.state] || AVAIL_LABEL.unverified;
+          return `<tr data-id="${esc(m.id)}">
+      <td class="cell-mono" style="color:var(--text)">${esc(m.id)}${m.limitedOffer ? ' <span class="tag warn">限量</span>' : ''}</td>
       <td><select class="inline js-tier">
         <option value="free"${m.tier === 'free' ? ' selected' : ''}>免费</option>
         <option value="paid"${m.tier === 'paid' ? ' selected' : ''}>付费</option>
       </select>${m.overridden ? ' <span class="tag">手动</span>' : ''}</td>
       <td><span class="tag ${m.tier}">${esc(m.pool)}</span></td>
+      <td><span class="tag ${cls}" title="${esc(av.detail || '')}${av.at ? ` · ${ago(av.at)}` : ''}">${label}</span></td>
       <td class="muted small">${esc(m.note)}</td>
       <td class="right"><input type="checkbox" class="switch js-on"${m.enabled ? ' checked' : ''}></td>
-      </tr>`
-        )
+      </tr>`;
+        })
         .join('')
-    : '<tr><td colspan="5" class="muted" style="padding:26px;text-align:center">没有匹配的模型</td></tr>';
+    : '<tr><td colspan="6" class="muted" style="padding:26px;text-align:center">没有匹配的模型</td></tr>';
 
   $$('#model-table tbody tr[data-id]').forEach((tr) => {
     const id = tr.dataset.id;
@@ -466,7 +675,47 @@ function renderModels(s) {
       sync(true);
     });
   });
+
+  // 「列表怎么来的」面板
+  const meta = s.modelStats || {};
+  const SOURCE_LABEL = {
+    official: '官方常量源码（最新，直接解析上游 freebuff-models.ts）',
+    'github-release': '第三方 GitHub Release JSON',
+    jsdelivr: 'jsDelivr 上的第三方仓库文件（可能落后几天）',
+    bundled: '仓库里随包的副本（离线兜底，可能过期）',
+  };
+  $('#m-source').textContent = SOURCE_LABEL[meta.source] || meta.source || '—';
+  const lim = meta.limits || {};
+  $('#m-limits').textContent = `Premium ${lim.premium ?? '?'} 次/天 · DeepSeek 家族另限 ${lim.deepseek ?? '?'} 次/天 · 非 Premium ${lim.standard ?? '?'}（CLI 协议下不限量）`;
+  $('#m-source-note').textContent = meta.generatedAt
+    ? `表生成时间 ${new Date(meta.generatedAt).toLocaleString('zh-CN', { hour12: false })}，共 ${meta.count} 个模型。分类只跟着上游额度池走，不是"要不要花钱"。`
+    : '';
+  $('#set-hidedead').checked = s.settings.hideUnavailableModels !== false;
+  const sel = $('#set-defaultmodel');
+  const cur = s.settings.defaultModel || '';
+  sel.innerHTML =
+    `<option value="">自动挑一个不限量的（当前：${esc(s.defaultModel || '—')}）</option>` +
+    s.models
+      .filter((m) => m.enabled)
+      .map((m) => `<option value="${esc(m.id)}"${m.id === cur ? ' selected' : ''}>${esc(m.id)}${m.tier === 'paid' ? '（付费）' : ''}</option>`)
+      .join('');
 }
+
+$('#set-hidedead').addEventListener('change', async (ev) => {
+  await api('/settings', { method: 'PATCH', body: { hideUnavailableModels: ev.target.checked } });
+  toast(ev.target.checked ? '实测不可用的模型不再对外提供' : '所有启用的模型都会列给客户端');
+  sync(true);
+});
+$('#set-defaultmodel').addEventListener('change', async (ev) => {
+  await api('/settings', { method: 'PATCH', body: { defaultModel: ev.target.value } });
+  toast(ev.target.value ? `不带 model 的请求走 ${ev.target.value}` : '恢复自动选择');
+  sync(true);
+});
+$('#btn-model-status-reset').addEventListener('click', async () => {
+  await api('/models/status/reset', { method: 'POST', body: {} });
+  toast('实测状态已清空，下次真实请求会重新学');
+  sync(true);
+});
 
 function renderSettings(s) {
   const auto = s.settings.autoSwitch !== false;
@@ -504,6 +753,14 @@ function renderSettings(s) {
     ? `可用 · ${s.browser.headless ? 'headless' : 'headful (Xvfb)'}`
     : `关闭 · ${s.browser.reason || s.browser.loadError || '未安装 Chromium'}`;
   $('#s-proxy').textContent = s.browser.proxy || '直连';
+  // 聊天记录
+  const chat = s.chatlog || {};
+  $('#set-chatlog').checked = Boolean(chat.enabled);
+  $('#s-chat-size').textContent = chat.files
+    ? `${fmtBytes(chat.bytes)} · ${chat.files} 个文件${chat.full ? '（已写满，已停止记录）' : ''}`
+    : '还没有记录';
+  $('#s-chat-limit').textContent = `${fmtBytes(chat.limitBytes || 0)}（写满就停，不会自动删旧的）`;
+
   const cred = s.credentials || {};
   const parts = [];
   if (cred.env) parts.push('环境变量 ADMIN_PASSWORD');
@@ -1085,3 +1342,137 @@ $('#btn-add-account').addEventListener('click', () => openAddAccount());
     lock('连不上服务端，稍后重试。');
   }
 })();
+
+// ─────────────────────────────────────────────── 聊天记录 / 存储清理
+async function loadStorage() {
+  try {
+    const info = await api('/storage');
+    const st = info.storage;
+    $('#s-store-total').textContent = `${fmtBytes(st.totalBytes)}${st.persistent ? '' : '（非持久）'}`;
+    $('#s-disk').textContent = st.disk
+      ? `${fmtBytes(st.disk.freeBytes)} 可用 / 共 ${fmtBytes(st.disk.totalBytes)}`
+      : '这个平台读不到磁盘信息';
+    $('#s-store-items').innerHTML = st.items
+      .map((i) => `<div><span>${esc(i.label)}</span><b>${fmtBytes(i.bytes)}</b></div>`)
+      .join('');
+  } catch (err) {
+    $('#s-store-total').textContent = `读取失败：${err.message}`;
+  }
+}
+
+$('#set-chatlog').addEventListener('change', async (ev) => {
+  await api('/settings', { method: 'PATCH', body: { chatLogEnabled: ev.target.checked } });
+  toast(
+    ev.target.checked
+      ? '已开始记录：之后每次请求的消息和回复都会落到 chatlog/*.jsonl'
+      : '已停止记录（已经存下来的不会动）',
+    ev.target.checked ? 'warn' : 'ok',
+    6000
+  );
+  sync(true);
+});
+
+$('#btn-chat-clear').addEventListener('click', async () => {
+  if (!confirm('删掉所有聊天记录文件？删了就找不回来了。')) return;
+  try {
+    const r = await api('/chatlog/clear', { method: 'POST' });
+    toast(`${r.note}，腾出 ${fmtBytes(r.bytes)}`);
+    sync(true);
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+});
+
+$('#btn-chat-view').addEventListener('click', async () => {
+  let data;
+  try {
+    data = await api('/chatlog');
+  } catch (err) {
+    return toast(err.message, 'err');
+  }
+  const files = data.files || [];
+  const recent = data.recent || [];
+  const d = openDialog(
+    '聊天记录',
+    `<p class="muted small">${
+      data.status.enabled ? '正在记录中。' : '记录当前是关闭的，下面是之前存下来的。'
+    } 一行一条 JSON（JSONL），可以直接喂给训练脚本。</p>
+    <div class="wire"><span class="wl">已存</span><code>${fmtBytes(data.status.bytes)} / ${files.length} 个文件</code></div>
+    ${
+      files.length
+        ? `<div class="storelist" style="margin:12px 0">${files
+            .map(
+              (f) =>
+                `<div><span>${esc(f.name)}</span><b>${fmtBytes(f.bytes)}</b><a class="btn tiny" href="/admin/api/chatlog/file/${esc(f.name)}" download>下载</a></div>`
+            )
+            .join('')}</div>`
+        : '<p class="muted small">还没有文件。</p>'
+    }
+    <div class="panel-title" style="margin-top:14px">最近 ${recent.length} 条</div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>时间</th><th>模型</th><th>请求</th><th>回复</th><th class="right">token</th></tr></thead>
+      <tbody>${
+        recent
+          .map(
+            (r) => `<tr><td class="cell-mono">${clock(r.at)}</td><td class="cell-mono">${esc(r.model || '—')}</td>
+        <td class="muted small">${esc((r.preview || '').slice(0, 70))}</td>
+        <td class="muted small">${esc((r.replyPreview || '').slice(0, 70))}</td>
+        <td class="right cell-mono">${r.usage ? `${fmtCompact(r.usage.input)}/${fmtCompact(r.usage.output)}` : '—'}</td></tr>`
+          )
+          .join('') || '<tr><td colspan="5" class="muted" style="padding:18px;text-align:center">没有记录</td></tr>'
+      }</tbody></table></div>`,
+    { width: 940 }
+  );
+  void d;
+});
+
+$$('[data-clean]').forEach((btn) =>
+  btn.addEventListener('click', async () => {
+    const level = btn.dataset.clean;
+    let info;
+    try {
+      info = await api('/storage');
+    } catch (err) {
+      return toast(err.message, 'err');
+    }
+    const preview = info.previews[level];
+    const rows = (preview.rows || [])
+      .map((r) => `<div><span>${esc(r.label)}</span><b>${r.bytes ? fmtBytes(r.bytes) : `${r.files} 项`}</b></div>`)
+      .join('');
+    const danger = level === 'full';
+    const d = openDialog(
+      `确认执行「${esc(preview.label)}」`,
+      `<p class="${danger ? 'note warn' : 'muted'} small">${
+        danger
+          ? '这会把账号池和 API key 一起删掉，等于回到刚部署的状态。管理密码会保留，否则你就进不来了。删之前建议先「导出备份」。'
+          : '下面这些会被删掉，其它数据不动。'
+      }</p>
+      <div class="storelist" style="margin:12px 0">${rows || '<div><span>没有可清理的内容</span></div>'}</div>
+      <div class="wire"><span class="wl">预计腾出</span><code>${fmtBytes(preview.freesBytes)}</code></div>
+      ${danger ? '<label class="field" style="margin-top:12px"><span class="lbl">确认请输入 DELETE</span><input type="text" id="clean-confirm" placeholder="DELETE"></label>' : ''}
+      <div class="dlg-foot"><button class="btn js-cancel" type="button">取消</button>
+        <button class="btn ${danger ? 'danger' : 'primary'}" id="clean-go" type="button">执行清理</button></div>`,
+      { width: 560 }
+    );
+    $('.js-cancel', d.root).addEventListener('click', d.close);
+    $('#clean-go', d.root).addEventListener('click', async () => {
+      const go = $('#clean-go', d.root);
+      go.disabled = true;
+      go.innerHTML = '<span class="spin"></span> 清理中';
+      try {
+        const body = { level };
+        if (danger) body.confirm = $('#clean-confirm', d.root).value.trim();
+        const r = await api('/cleanup', { method: 'POST', body });
+        toast(`${r.label}完成：${r.done.join('、') || '没有可删的'}，腾出 ${fmtBytes(r.freedBytes)}`, 'ok', 8000);
+        d.close();
+        await sync();
+        loadStorage();
+        if (VIEW === 'usage') loadUsage();
+      } catch (err) {
+        toast(err.message, 'err', 7000);
+        go.disabled = false;
+        go.textContent = '执行清理';
+      }
+    });
+  })
+);

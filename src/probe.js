@@ -2,6 +2,7 @@
 // 判定表对齐上游 freebuff-session-api.ts 语义（和原项目 extract_freebuff.py 的 _check_one 一致）。
 import { config } from './config.js';
 import { httpJson } from './util.js';
+import { learnFromQuotaSnapshot } from './models.js';
 
 function formatQuota(rateLimits) {
   if (!rateLimits || typeof rateLimits !== 'object') return '';
@@ -30,7 +31,18 @@ export async function probeAccount(token) {
 
   const data = resp.data;
   const quota = formatQuota(data?.rateLimitsByModel);
-  const base = { quota, httpStatus: resp.status };
+  // 顺手把"上游确实在给这个号计量哪些模型"学下来 —— 这是 0 成本拿到的真可用性信号
+  try {
+    learnFromQuotaSnapshot(data?.rateLimitsByModel, data?.limitedModelOffers || data?.limitedOffers);
+  } catch {
+    /* 学不到就算了，不影响探活结果 */
+  }
+  const base = {
+    quota,
+    httpStatus: resp.status,
+    accessTier: data?.accessTier || null,
+    quotaModels: data?.rateLimitsByModel && typeof data.rateLimitsByModel === 'object' ? Object.keys(data.rateLimitsByModel) : [],
+  };
 
   if (resp.status === 0) {
     return { ...base, state: 'network_error', verdict: '网络错误', detail: resp.error || '请求上游失败' };

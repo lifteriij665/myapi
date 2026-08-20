@@ -49,6 +49,10 @@ for (const p of [
 // ── 功能回归 ──
 const st = await admin('/state');
 KEY = st.json.keys[0].key;
+const FREE_MODEL = st.json.models.find((m) => m.tier === 'free' && m.enabled && !m.limitedOffer)?.id;
+const PAID_MODEL = st.json.models.find((m) => m.tier === 'paid' && m.enabled)?.id;
+const OTHER_FREE = st.json.models.find((m) => m.tier === 'free' && m.id !== FREE_MODEL)?.id;
+check('能从 state 里挑出免费/付费模型', Boolean(FREE_MODEL && PAID_MODEL), `free=${FREE_MODEL} paid=${PAID_MODEL}`);
 check('state 正常', st.status === 200 && Array.isArray(st.json.models), `${st.status}`);
 
 const models = await (await raw('/v1/models', { headers: { authorization: `Bearer ${KEY}` } })).json();
@@ -57,14 +61,14 @@ check('免费 key 只看到免费模型', models.data.every((m) => !/luna|v4-pro
 const paid = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-  body: JSON.stringify({ model: 'openai/gpt-5.6-luna', messages: [{ role: 'user', content: 'x' }] }),
+  body: JSON.stringify({ model: PAID_MODEL, messages: [{ role: 'user', content: 'x' }] }),
 });
-check('付费模型对免费 key 仍然 403', paid.status === 403, `${paid.status}`);
+check('付费模型对免费 key 仍然 403', paid.status === 403, `${PAID_MODEL} → ${paid.status}`);
 
 const suffix = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-  body: JSON.stringify({ model: 'gpt-5.6-luna', messages: [{ role: 'user', content: 'x' }] }),
+  body: JSON.stringify({ model: PAID_MODEL.split('/').pop(), messages: [{ role: 'user', content: 'x' }] }),
 });
 check('去掉厂商前缀也绕不过付费门禁', suffix.status === 403, `${suffix.status} ${(await suffix.text()).slice(0, 120)}`);
 
@@ -72,7 +76,7 @@ await admin('/accounts', 'POST', { token: 'fake-token-for-sec-test-000000', emai
 const called = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-  body: JSON.stringify({ model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'x' }] }),
+  body: JSON.stringify({ model: FREE_MODEL, messages: [{ role: 'user', content: 'x' }] }),
 });
 const text = await called.text();
 check('上游失败的错误里不含账号邮箱', !text.includes('sec@t.com'), text.slice(0, 200));
@@ -87,14 +91,15 @@ const big = 'x'.repeat(9 * 1024 * 1024);
 const tooBig = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-  body: JSON.stringify({ model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: big }] }),
+  body: JSON.stringify({ model: FREE_MODEL, messages: [{ role: 'user', content: big }] }),
 });
 check('超过 8MB 的请求体被拒', tooBig.status === 413 || tooBig.status === 400, `${tooBig.status}`);
 
 
 // ── 不带 model 也要过门禁 ──
 const onlyMimo = (await admin('/keys', 'POST', { name: 'only-mimo', allowPaid: false })).json.key;
-await admin(`/keys/${onlyMimo.id}`, 'PATCH', { models: ['mimo/mimo-v2.5'] });
+// 白名单里故意不放默认模型，这样"不带 model"的请求必须被拒
+await admin(`/keys/${onlyMimo.id}`, 'PATCH', { models: [OTHER_FREE || PAID_MODEL] });
 const bypass = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${onlyMimo.key}` },
@@ -154,5 +159,94 @@ for (let i = 0; i < 40; i++) {
 }
 check('伪造 XFF 绕过按 IP 计数后被全局软限速拖慢', throttled, '40 次都没触发延迟');
 
-console.log(`\n通过 ${pass} / 失败 ${fail}`);
+
+// ── 用量统计 ──
+const before = (await admin('/usage')).json.usage.totals.requests;
+await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: FREE_MODEL, messages: [{ role: 'user', content: '用量统计测试' }] }),
+});
+const u = (await admin('/usage')).json.usage;
+check('请求被记进用量', u.totals.requests > before, `${before} → ${u.totals.requests}`);
+check('用量里带模型维度', u.byModel.some((m) => m.id === FREE_MODEL), JSON.stringify(u.byModel.map((m) => m.id)));
+check('明细里有耗时和状态', u.recent.length > 0 && typeof u.recent[0].latencyMs === 'number', JSON.stringify(u.recent[0] || null).slice(0, 120));
+check('48 小时序列长度正确', u.hours.length === 48, String(u.hours.length));
+check('30 天序列长度正确', u.days.length === 30, String(u.days.length));
+
+// 被门禁拒掉的请求也要能看到
+await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: PAID_MODEL, messages: [{ role: 'user', content: 'x' }] }),
+});
+const u2 = (await admin('/usage')).json.usage;
+check('被门禁拒掉的请求也记进用量', u2.recent.some((e) => e.error === 'model_denied'), JSON.stringify(u2.recent.map((e) => e.error)));
+
+// ── SSE 实时推送 ──
+const sseText = await (async () => {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 3500);
+  try {
+    const r = await fetch(`${BASE}/admin/api/events`, { headers: { cookie }, signal: ctrl.signal });
+    const reader = r.body.getReader();
+    const { value } = await reader.read();
+    await reader.cancel().catch(() => {});
+    return new TextDecoder().decode(value);
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(t);
+  }
+})();
+check('SSE 能推出一帧数据', sseText.startsWith('data: ') && sseText.includes('"usage"'), sseText.slice(0, 80));
+
+// ── 聊天记录 ──
+await admin('/settings', 'PATCH', { chatLogEnabled: true });
+await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: FREE_MODEL, messages: [{ role: 'user', content: '记录这句话' }] }),
+});
+const log = (await admin('/chatlog')).json;
+check('聊天记录写进了文件', log.status.files >= 1 && log.status.bytes > 0, JSON.stringify(log.status));
+check('记录能按最后一条用户消息预览', log.recent.some((r) => (r.preview || '').includes('记录这句话')), JSON.stringify(log.recent.map((r) => r.preview)));
+const dl = await raw(`/admin/api/chatlog/file/${log.files[0].name}`, { headers: { cookie } });
+check('记录文件能下载成 JSONL', dl.status === 200 && (await dl.text()).trim().split('\n').every((l) => l.startsWith('{')), String(dl.status));
+await admin('/settings', 'PATCH', { chatLogEnabled: false });
+const off = await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: FREE_MODEL, messages: [{ role: 'user', content: '这句不该被记下来' }] }),
+});
+void off;
+const log2 = (await admin('/chatlog')).json;
+check('关掉之后不再记新的', !log2.recent.some((r) => (r.preview || '').includes('这句不该被记下来')), 'off 之后还在记');
+
+// ── 存储盘点 + 分级清理 ──
+const store1 = (await admin('/storage')).json;
+check('存储盘点列出了各类占用', store1.storage.items.length >= 5 && typeof store1.storage.totalBytes === 'number', JSON.stringify(store1.storage.items.map((i) => i.key)));
+check('三档清理都有预览', ['routine', 'deep', 'full'].every((l) => store1.previews[l]?.rows), Object.keys(store1.previews).join(','));
+
+const routine = await admin('/cleanup', 'POST', { level: 'routine' });
+const afterRoutine = (await admin('/chatlog')).json;
+const usageKept = (await admin('/usage')).json.usage.totals.requests;
+check('日常清理删掉了聊天记录', routine.status === 200 && afterRoutine.status.files === 0, JSON.stringify(routine.json?.done));
+check('日常清理保留了用量统计', usageKept > 0, `requests=${usageKept}`);
+
+const deep = await admin('/cleanup', 'POST', { level: 'deep' });
+const usageAfterDeep = (await admin('/usage')).json.usage.totals.requests;
+const stateAfterDeep = (await admin('/state')).json;
+check('清除不必要数据把用量也清了', deep.status === 200 && usageAfterDeep === 0, `requests=${usageAfterDeep}`);
+check('清除不必要数据保留账号和 Key', stateAfterDeep.accounts.length > 0 && stateAfterDeep.keys.length > 0, `accounts=${stateAfterDeep.accounts.length} keys=${stateAfterDeep.keys.length}`);
+
+const noConfirm = await admin('/cleanup', 'POST', { level: 'full' });
+check('全部清理必须带 confirm', noConfirm.status === 400, String(noConfirm.status));
+const full = await admin('/cleanup', 'POST', { level: 'full', confirm: 'DELETE' });
+const stateAfterFull = (await admin('/state')).json;
+check('全部清理清空账号并补一个新 Key', full.status === 200 && stateAfterFull.accounts.length === 0 && stateAfterFull.keys.length === 1, JSON.stringify(full.json?.done));
+const stillLoggedIn = await admin('/session');
+check('全部清理之后还能登录（密码保留）', stillLoggedIn.json?.authed === true, JSON.stringify(stillLoggedIn.json));
+
+console.log(`\n集成测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

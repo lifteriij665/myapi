@@ -11,6 +11,7 @@ import { WebSocketServer } from 'ws';
 
 import { config, ensureDirs } from './config.js';
 import { store } from './store.js';
+import { usage } from './usage.js';
 import { handleAdminApi, isAuthed } from './admin.js';
 import { handleApiRequest } from './engine.js';
 import { getSession, closeAllBrowsers, browserFeature } from './browser.js';
@@ -138,6 +139,7 @@ export function createApp() {
   ensureDirs();
   try {
     store.load();
+    usage.load();
   } catch (err) {
     // 数据目录有问题也要把服务起起来：至少 /healthz 和控制台能回话，
     // 用户才看得到"数据目录不可写"这种提示，而不是面对一个健康检查失败的部署。
@@ -269,6 +271,7 @@ if (isMain || process.env.MYAPI_FORCE_START === '1') {
   const shutdown = async (signal) => {
     console.log(`[myapi] 收到 ${signal}，正在收尾…`);
     store.saveNow();
+    usage.saveNow();
     await closeAllBrowsers().catch(() => {});
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 8000);

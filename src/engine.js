@@ -15,8 +15,12 @@ import {
   tierOf,
   isKnownModel,
   looksLikeClaude,
+  recordModelResult,
+  defaultModel,
   DEFAULT_MODEL,
 } from './models.js';
+import { usage, usageFromJson, createUsageSniffer } from './usage.js';
+import { appendChat } from './chatlog.js';
 import { readBody, randomId, createRateLimiter, createGate, clientIp } from './util.js';
 
 // 同时在处理的 /v1 请求数上限：每个请求都可能带几 MB body + 一条上游流
@@ -415,13 +419,59 @@ async function dispatchApi(req, res, url) {
     send(res, 404, errorBody(pathname, `模型 ${rawModel} 不存在；GET /v1/models 可以看当前可用的模型`, 404));
     return;
   }
-  // 没写 model 的请求上游会按默认模型跑，所以这里也得按默认模型去过门禁 ——
-  // 否则"不带 model"就成了绕开 key 白名单和已下架模型的口子
-  if (needsModelAuth && !requestedModel) requestedModel = DEFAULT_MODEL;
+  // 没写 model 的请求：按当前"不限量"那一档挑一个（见 models.defaultModel），
+  // 并且照样过门禁 —— 否则"不带 model"就成了绕开 key 白名单和已下架模型的口子。
+  // 解析出来的 id 会写回请求体，所以引擎拿到的是这里定下来的模型，不是它自己的默认值。
+  if (needsModelAuth && !requestedModel) requestedModel = defaultModel();
+
+  const protocol = isAnthropic ? 'anthropic' : pathname.endsWith('/responses') ? 'responses' : 'openai';
+  const startedAt = Date.now();
+  /** 记一条用量 + 可选的聊天记录；任何异常都不能影响响应本身 */
+  const track = ({ acct, status, ok, usageInfo, bytesOut, ttfbMs, error, replyText }) => {
+    try {
+      usage.record({
+        ts: startedAt,
+        keyId: keyRecord.id,
+        keyName: keyRecord.name,
+        accountId: acct?.id || '',
+        model: requestedModel || '',
+        tier: requestedModel ? tierOf(requestedModel) : '',
+        protocol,
+        stream: Boolean(parsed?.stream),
+        status,
+        ok,
+        latencyMs: Date.now() - startedAt,
+        ttfbMs: ttfbMs || 0,
+        usage: usageInfo || null,
+        bytesIn: raw.length,
+        bytesOut: bytesOut || 0,
+        error: error || null,
+      });
+      appendChat({
+        model: requestedModel,
+        tier: requestedModel ? tierOf(requestedModel) : '',
+        protocol,
+        stream: Boolean(parsed?.stream),
+        status,
+        ok,
+        latencyMs: Date.now() - startedAt,
+        keyId: keyRecord.id,
+        keyName: keyRecord.name,
+        accountId: acct?.id || '',
+        usage: usageInfo || null,
+        request: parsed,
+        response: replyText ?? null,
+        error: error || null,
+      });
+    } catch (err) {
+      console.error(`[engine] 记录用量失败：${err.message}`);
+    }
+  };
 
   if (needsModelAuth) {
     const verdict = checkModelAccess(keyRecord, requestedModel);
     if (!verdict.ok) {
+      track({ status: verdict.status, ok: false, error: 'model_denied' });
       send(res, verdict.status, errorBody(pathname, verdict.message, verdict.status));
       return;
     }
@@ -477,6 +527,7 @@ async function dispatchApi(req, res, url) {
         : '手动模式下指定的账号已停用或不能承接这个模型，去控制台换一个';
     else if (tier === 'paid') hint = '没有能承接付费(Premium)模型的账号：检查账号的「用途」是不是被限制成了仅免费';
     else hint = '账号池里没有可用账号（可能都被停用或已标记失效）';
+    track({ status: 503, ok: false, error: 'no_account' });
     send(res, 503, errorBody(pathname, hint, 503));
     return;
   }
@@ -503,6 +554,7 @@ async function dispatchApi(req, res, url) {
     }
     const text = await resp.text().catch(() => '');
     const state = classifyFailure(resp.status, text);
+    recordModelResult(requestedModel, { ok: false, status: resp.status, text });
     store.setAccountStatus(acct.id, {
       state,
       verdict: FAILURE_TEXT[state] || '上游失败',
@@ -528,6 +580,12 @@ async function dispatchApi(req, res, url) {
       `[engine] ${pathname} 全部账号失败：${tried.join(', ')}${last ? ` | 最后一条：HTTP ${last.status} ${String(last.text).slice(0, 300)}` : ''}`
     );
     const status = last?.status === 429 ? 429 : 502;
+    track({
+      acct: last?.acct,
+      status,
+      ok: false,
+      error: last ? `${last.state}: HTTP ${last.status}` : 'no_account',
+    });
     send(res, status, errorBody(pathname, `上游调用失败（${reason}）${suffix}，详情见控制台的账号状态`, status), {
       'x-myapi-accounts-tried': String(tried.length),
       ...(status === 429 ? { 'retry-after': '60' } : {}),
@@ -554,14 +612,32 @@ async function dispatchApi(req, res, url) {
 
   const contentType = String(response.headers.get('content-type') || '');
   const isSse = contentType.includes('text/event-stream');
+  const wantChat = Boolean(store.settings?.chatLogEnabled);
 
-  // Anthropic 非流式：整段读出来补 id / usage 再发
-  if (isAnthropic && !isSse) {
+  // 非流式（JSON 一整段）：读完再发，顺手取 usage、补 Anthropic 的 id
+  if (!isSse) {
     const text = await response.text();
+    let payload = null;
     try {
-      const payload = patchAnthropicMessage(JSON.parse(text));
+      payload = JSON.parse(text);
+    } catch {}
+    const usageInfo = payload ? usageFromJson(payload) : null;
+    const ok = response.status < 400;
+    recordModelResult(requestedModel, { ok, status: response.status, text: ok ? '' : text });
+    track({
+      acct: used,
+      status: response.status,
+      ok,
+      usageInfo,
+      bytesOut: Buffer.byteLength(text),
+      replyText: wantChat ? replyTextFrom(payload) : null,
+      error: ok ? null : `HTTP ${response.status}`,
+    });
+    if (payload && isAnthropic) {
+      send(res, response.status, patchAnthropicMessage(payload), headers);
+    } else if (payload) {
       send(res, response.status, payload, headers);
-    } catch {
+    } else {
       res.writeHead(response.status, { 'content-type': 'application/json; charset=utf-8', ...CORS, ...headers });
       res.end(text);
     }
@@ -570,13 +646,17 @@ async function dispatchApi(req, res, url) {
 
   res.writeHead(response.status, { ...CORS, ...headers });
   if (!response.body) {
+    track({ acct: used, status: response.status, ok: false, error: 'empty_body' });
     res.end();
     return;
   }
 
-  const patcher = isAnthropic && isSse ? createAnthropicStreamPatcher() : null;
-  const decoder = patcher ? new TextDecoder() : null;
+  const patcher = isAnthropic ? createAnthropicStreamPatcher() : null;
+  const sniffer = createUsageSniffer({ collectText: wantChat });
+  const decoder = new TextDecoder();
   const reader = response.body.getReader();
+  let bytesOut = 0;
+  let ttfbMs = 0;
   // 客户端一断开就把上游流也取消掉：不取消的话上游会继续把整段输出生成完，
   // 那条 session 也一直占着 —— 相当于让人用"发出即断"白烧号池额度
   let aborted = false;
@@ -591,8 +671,12 @@ async function dispatchApi(req, res, url) {
       if (done) break;
       if (aborted || res.writableEnded || res.destroyed) break;
       if (!value) continue;
-      const chunk = patcher ? patcher.push(decoder.decode(value, { stream: true })) : Buffer.from(value);
+      if (!ttfbMs) ttfbMs = Date.now() - startedAt;
+      const text = decoder.decode(value, { stream: true });
+      sniffer.push(text);
+      const chunk = patcher ? patcher.push(text) : Buffer.from(value);
       if (!chunk || (patcher && !chunk.length)) continue;
+      bytesOut += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
       // 尊重背压：写不动的时候等 drain，否则慢客户端会把内存撑起来
       if (!res.write(chunk)) {
         await new Promise((resolve) => {
@@ -612,7 +696,33 @@ async function dispatchApi(req, res, url) {
     res.off('close', onClientGone);
     if (!aborted) reader.cancel().catch(() => {});
     if (!res.writableEnded) res.end();
+    recordModelResult(requestedModel, { ok: !aborted, status: response.status, text: '' });
+    track({
+      acct: used,
+      status: response.status,
+      ok: !aborted,
+      usageInfo: sniffer.result(),
+      bytesOut,
+      ttfbMs,
+      replyText: wantChat ? sniffer.text : null,
+      error: aborted ? 'client_aborted' : null,
+    });
   }
+}
+
+/** 从非流式响应里抽出模型正文（只给聊天记录用） */
+function replyTextFrom(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (Array.isArray(payload.content)) {
+    return payload.content
+      .filter((c) => c && c.type === 'text' && typeof c.text === 'string')
+      .map((c) => c.text)
+      .join('\n');
+  }
+  const choice = payload.choices?.[0];
+  if (choice?.message?.content) return String(choice.message.content);
+  if (typeof payload.output_text === 'string') return payload.output_text;
+  return null;
 }
 
 /** 取 worker 视角的账号健康快照（不额外调上游，只读 worker 内存里的观测结果） */
