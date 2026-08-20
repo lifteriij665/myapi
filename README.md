@@ -5,7 +5,8 @@
 - 🔐 **输入管理员密码解锁**，进主页就能管号池，不用改环境变量、不用重新部署
 - 🌐 **在网页里直接登录加号**：走官方 CLI 那条授权码链路，点一下按钮就跳登录页，服务器轮询到 token 自动入池。**不需要 Telegram 机器人，不需要本地跑脚本**
 - 🖥️ **还带一个服务器内置浏览器**：容器里跑 patchright Chromium（headful + Xvfb，指纹接近真机），画面用 CDP 截屏推到网页上，你可以在网页里点、打字，直接在服务器上完成登录
-- 🧩 **两个上游合成一个号池**：除了 freebuff，还接了 **[opencode Zen](https://opencode.ai/zen)**（`https://opencode.ai/zen/v1`）。Zen 的号就是一个 API key，粘进来就能用，**默认只跑它的免费模型**；一个 Zen 号都没有时还能用官方 CLI 的 `public` 匿名凭证直接调免费模型
+- 🧩 **两个内置上游 + 任意多个自定义上游**：内置 freebuff 和 **[opencode Zen](https://opencode.ai/zen)**；此外可以自己加任意接口地址，支持 **OpenAI Chat Completions / OpenAI Responses / Anthropic Messages / Gemini generateContent** 四种协议，一次贴几十个 API key，模型清单可以从上游拉也可以手填
+- 🔀 **五种换号策略，每个上游各设一套、互不干扰**：轮询 / 随机 / 额度用完才换 / 一出错就换 / 单号（只手动切），带批量一键应用
 - 👥 **多账号号池**：每个号可以设"全部模型 / 仅免费 / 付费优先"，付费模型只会落到允许的号上
 - 💳 **模型分免费和付费**：每个 API key 一个「允许付费模型」勾选框，不勾就只给免费模型，Premium 那几次/天的额度不会被误烧
 - 🔑 **多 API key**：分客户端发 key、单独停用、看调用次数
@@ -15,18 +16,22 @@
 - 📋 **一键复制**：Base URL、API key、完整配置，复制完直接粘到 Cherry Studio / ChatGPT-Next-Web / one-api 里
 
 对外接口和原项目一致：`/v1/chat/completions`、`/v1/models`、`/v1/responses`、`/v1/messages`（Anthropic 协议）、`/healthz`。
-两个上游的模型合并成一张表对外给出去，opencode 那边的 id 统一带 `opencode/` 前缀（例如 `opencode/mimo-v2.5-free`），不会和 freebuff 的 `厂商/模型` 撞车。
+所有上游的模型合并成一张表对外给出去，非 freebuff 的 id 统一带上游名前缀（`opencode/mimo-v2.5-free`、`my-relay/gpt-4o`），不会和 freebuff 的 `厂商/模型` 撞车。网关内部一律以 OpenAI Chat Completions 为中枢格式，进出各翻一次 —— 所以**任意客户端协议都能打到任意上游协议**，比如用 Claude Code 去调一个只会说 Gemini 的中转。
 
 > 引擎文件 `vendor/worker.js` 原样引用上游（当前 **1.8.10**）、**一行没改**，方便随时 `npm run update-worker` 升级。所有新增能力都在 `src/` 这一层，控制台「模型」卡里会显示当前引擎版本。
-> opencode Zen 那条路**不经过** `vendor/worker.js`，是 `src/opencode.js` 直接发 HTTPS。
+> opencode Zen 和自定义上游都**不经过** `vendor/worker.js`：前者走 `src/opencode.js`，后者走 `src/protocols/` 里的适配器，都是直接发 HTTPS。
 
 ## 控制台长什么样
 
-概览：号池状态一条一条排开（灯 = 存活状态，条 = 额度用了多少），下面是可以直接复制的接入信息。
+概览：每个上游一条通道（灯 = 有没有可用 key，下面是当前的换号策略），下面是可以直接复制的接入信息。
 
 ![概览](docs/console-overview.png)
 
-账号池：每个号单独设「用途」，一键 0 消耗探活，额度快照直接显示。
+上游：一张卡一个上游。换号策略就在卡上点，五个策略哪个在用一眼就看得见；「批量设策略」能一次套用到多个上游。
+
+![上游](docs/console-upstreams.png)
+
+账号池：可以按上游筛。freebuff 那类账号显示邮箱和额度快照，纯 API key 的上游就直接显示打码的 key。
 
 ![账号池](docs/console-accounts.png)
 
@@ -34,7 +39,7 @@
 
 ![内置浏览器](docs/console-browser-login.png)
 
-模型：按上游额度池自动分成免费 / 付费，可以手动改分类、也可以直接下架某个模型。
+模型：所有上游的模型合成一张表，按上游 / 免费付费 / 可用性筛，可以手动改分类或直接下架。
 
 ![模型](docs/console-models.png)
 
@@ -191,26 +196,71 @@ Zen 的免费/付费是**明码标价**的（就是"要不要花你自己的钱"
 - **401 不一定是 key 错了**：Zen 把余额耗尽、月度上限、模型被工作区管理员停用也都回 401。控制台按上游的 `error.type`（`AuthError` / `CreditsError` / `RegionError` / `FreeUsageLimitError` …）分类，不靠在正文里捞字符串。
 - **`GET /zen/v1/models` 免鉴权**，所以一个 Zen 号都没有也能拉到完整模型表；拉不到就退回随包的免费名单，不会让控制台里一个 opencode 模型都不剩。
 
-## 三点五、账号怎么切（不轮询）
+## 三点五、账号怎么切（五种策略，每个上游各设一套）
 
-默认策略是**钉住一个号用到失败为止**，不是轮询：
+**每个上游一套换号策略，互不干扰。** 在控制台「上游」那一页，每张卡上直接点：
 
-- 每个请求只把**一个** token 交给引擎，所以引擎内部那套轮询逻辑等于被关掉了
-- 只有当前这个号真的失败了（额度用完 / token 失效 / 上游拒绝 / 超时），才顺延到下一个号，并把新号钉住
-- 顺延时会把失败原因写回控制台的状态列，`x-myapi-accounts-tried` 响应头里能看到这次试过哪些号
-- 这样比轮询省额度：freebuff 是**按创建 session 计费**的，一个 session 能用约 1 小时，钉住同一个号就能把这一小时用满
+| 策略 | 行为 | 什么时候用 |
+|---|---|---|
+| **额度用完才换**（内置上游默认） | 钉住一个号用到额度耗尽或凭据失效才换 | freebuff 这种**按创建 session 计费**的上游：一个 session 能用约 1 小时，钉住同一个号才能把这一小时用满 |
+| **轮询** | 每个请求依次用下一个号，均摊压力 | 一堆等价的商业 key，想把 TPM 摊开 |
+| **随机** | 每个请求随机挑一个起点 | 同上，但不想让指针有规律（有些上游会按序列特征限流） |
+| **一出错就换** | 只要这次请求失败就换下一个号（含上游 5xx、网络错误） | key 质量参差不齐的号池，宁可多试几个也不要把错误抛给客户端 |
+| **单号（只手动切）** | 只用你指定的那一个号，失败也不换，直接把错误抛给客户端 | 调试、或者想精确控制某个 key 的消耗 |
 
-控制台「设置 → 账号切换」里有两个开关：
+前四种都会在失败时顺延到下一个号，区别只在"什么算失败"：默认只在**换号可能有用**时才换（额度、凭据、上游 5xx），`400`/`404` 这类是请求本身写错了，换一百个号也一样；「一出错就换」放宽到所有失败，但仍然排除这些客户端错误 —— 换号纯属白烧额度。
 
-| 设置 | 行为 |
+顺延时会把失败原因写回控制台的状态列，响应头 `x-myapi-accounts-tried` 是这次试过几个号，`x-myapi-rotation` 是当时用的策略。
+
+**批量改**：「上游」页右上角「批量设策略」，选一个策略 + 勾要套用的上游，一键应用。不勾就是全部。
+
+**每个上游各排各的队**：选号第一步先按"这个模型属于哪个上游"筛 —— `opencode/xxx` 只会落到 opencode 的号上，`my-relay/xxx` 只会落到那个自定义上游的号上。而且这一步在"全被标记失效时仍然放行"那条兜底逻辑**之前** —— 不然一边的号全挂了，兜底会把另一边的号捞过来，拿着错的凭据去撞上游。opencode 的免费模型还多一条：号池里一个 opencode 号都没有时，会退到 `public` 匿名凭证（`OPENCODE_ANONYMOUS=false` 可关），响应头会标 `x-myapi-rotation: anonymous`。每个响应都带 `x-myapi-provider`，能看出这一次走的是哪个上游。
+
+> 从旧版本升上来的部署不用动：原来那个全局「自动切换账号」开关会按语义翻译成新策略 —— 开着＝「额度用完才换」，关掉＝「单号」，行为完全不变。
+
+---
+
+## 三点七、自定义上游（接任意 OpenAI / Anthropic / Gemini 兼容接口）
+
+除了内置的 freebuff 和 opencode，还能自己加任意多个上游。一个上游 = **接口地址 + 协议格式 + 一批 API key**。
+
+控制台「上游 → 添加上游」，填四样东西：
+
+| 字段 | 说明 |
 |---|---|
-| **自动切换账号**（默认开） | 当前号失败才换下一个；换完的号会成为新的"当前号" |
-| 关掉自动切换 | **只用**你指定的那个号，它不可用时请求直接返回 503，绝不偷偷换号 |
-| **当前使用的账号** | 手动指定从哪个号开始用；留空＝下一次请求自己挑第一个可用的 |
+| **名称** | 也会当模型 id 的前缀。填 `my-relay`，它的模型对外就是 `my-relay/gpt-4o` —— 这样多个上游都有 `gpt-4o` 也不会撞车 |
+| **接口地址** | 填到 `/v1` 这一层，不含 `/chat/completions`。会自动补 `https://`、去掉末尾斜杠 |
+| **协议格式** | 四种：`OpenAI Chat Completions` / `OpenAI Responses API` / `Anthropic Messages` / `Gemini Native generateContent` |
+| **默认分类** | 整个上游算免费还是付费。默认**付费**（fail-closed）：没勾「允许付费模型」的 key 用不了它，免得拿着你的商业 key 随便刷 |
 
-「账号池」里每行都有「设为当前」按钮，概览的通道条上当前那个号会标 `当前`。
+**API key 可以一次贴几十个**，一行一个，重复的自动跳过。加完点「检测」逐个探活。
 
-**两个上游各排各的队**：选号第一步先按"这个模型属于哪个上游"筛，`opencode/` 的模型只会落到 opencode 的号上，反之也一样。而且这一步在"全被标记失效时仍然放行"那条兜底逻辑**之前** —— 不然一边的号全挂了，兜底会把另一边的号捞过来，拿着错的凭据去撞上游。opencode 的免费模型还多一条：号池里一个 opencode 号都没有时，会退到 `public` 匿名凭证（`OPENCODE_ANONYMOUS=false` 可关），响应头 `x-myapi-rotation: anonymous` 会标出来。每个响应都带 `x-myapi-provider`，能看出这一次走的是哪个上游。
+**模型清单两种来法**：
+
+- **拉取模型** —— 用池子里的 key 去问上游的 `/models`。四种协议的返回形状都能认（OpenAI 的 `{data:[{id}]}`、Gemini 的 `{models:[{name}]}`、以及直接返回字符串数组的）。会依次试每个 key，直到有一个拉到。
+- **手动添加** —— 上游没实现 `/models` 就自己填，一行一个模型名（填上游认的原名，不用带前缀）。
+
+### 协议怎么转的
+
+网关内部一律以 **OpenAI Chat Completions 为中枢格式**（门禁、用量统计、聊天记录都读 chat 的字段）。进出各翻一次：
+
+```
+客户端协议 --(翻成 chat)--> 门禁/日志 --(翻成上游协议)--> 上游
+                                      <--(翻回 chat)--
+```
+
+好处是**任意客户端协议 × 任意上游协议**都不用单独写代码 —— 4×4 十六种组合共用同一条链路。所以你用 Claude Code（Anthropic 协议）也能直接打到一个只会说 Gemini 的上游。
+
+覆盖范围：文本、system / instructions、多轮、tools（function calling）、结束原因、usage、流式。四种协议的适配器在 `src/protocols/`，各自带单测；另有一个假上游（`tests/mock-upstream.mjs`）把 4 种上游协议 × 2 种客户端协议 × 流式/非流式全跑一遍真链路。
+
+几个转换里的坑，都处理过了：
+
+- **Gemini 没有 `system` 角色**，要提到 `systemInstruction`；也**没有 `tool_call_id`**，工具结果得靠回溯上一条 assistant 消息里的 `tool_calls[].id` 才能拿到函数名。它还严格要求 user/model 交替，所以连续同角色的消息必须合并成一条，否则直接被上游拒掉。
+- **Gemini 拒绝 JSON-Schema 里的未知关键字**，`$schema` / `additionalProperties` / `default` 要递归剥掉。
+- **Responses 的 `tools` 是扁平的**（`{type,name,parameters}`），chat 那边是嵌套的（`{type,function:{...}}`）；`function_call` / `function_call_output` 是独立的 input 项，不像 chat 挂在消息上。
+- **Anthropic 的 `max_tokens` 是必填的**，OpenAI 客户端不给就得补一个默认值。
+- **`401` 不一定是 key 错了**：很多中转把余额耗尽、月度上限也回 401；`429` 也分"限速"和"欠费"两种。归类时状态码为主、正文关键词为辅，因为第三方中转的错误信封五花八门。
+- **接口地址拒绝内网和云元数据地址**（`127.0.0.1`、`10.x`、`169.254.169.254` …）。这个服务通常跑在公网容器里，填内网地址等于把网关变成打内网的跳板。确实要连内网时设 `ALLOW_PRIVATE_UPSTREAM=true`。
 
 ---
 
@@ -268,6 +318,7 @@ Zen 的免费/付费是**明码标价**的（就是"要不要花你自己的钱"
 | `OPENCODE_API_KEY` | 空 | 预置 opencode Zen 的 API key，逗号或换行分隔。加进来的号默认只服务免费模型 |
 | `OPENCODE_ANONYMOUS` | `true` | 号池里没有 opencode 号时，是否用官方 CLI 的 `public` 匿名凭证调 Zen 的免费模型。上游按出口 IP 限流，共享 IP 上容易 429 |
 | `OPENCODE_API` | `https://opencode.ai/zen/v1` | Zen 的接口地址，一般不用改 |
+| `ALLOW_PRIVATE_UPSTREAM` | `false` | 允许自定义上游填内网 / 云元数据地址（默认拦掉，防把网关当内网跳板） |
 | `ALLOW_PAID_DEFAULT` | `false` | 新建 API key 时「允许付费模型」的默认值 |
 | `ENABLE_BROWSER_LOGIN` | `true` | `false` = 关掉内置浏览器（也不再用 Xvfb 启动） |
 | `BROWSER_HEADLESS` | `auto` | `auto` = 有 Xvfb 就 headful（指纹更好），没有就 headless |
@@ -332,7 +383,16 @@ curl https://你的域名/v1/messages \
   -d '{"model":"opencode/mimo-v2.5-free","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
-响应头里有三个自定义字段方便排查：`x-myapi-provider`（这次走了哪个上游）、`x-myapi-rotation`（`sticky` / `manual` / `anonymous`）、`x-myapi-model-tier`（免费还是付费）。
+自定义上游的模型也是一样，模型名带上游名前缀就行：
+
+```bash
+curl https://你的域名/v1/chat/completions \
+  -H "Authorization: Bearer sk-fb-你的key" \
+  -H 'content-type: application/json' \
+  -d '{"model":"my-relay/gpt-4o","messages":[{"role":"user","content":"你好"}]}'
+```
+
+响应头里有三个自定义字段方便排查：`x-myapi-provider`（这次走了哪个上游）、`x-myapi-rotation`（当时用的换号策略，或 `anonymous`）、`x-myapi-model-tier`（免费还是付费）。
 
 ---
 
@@ -357,7 +417,8 @@ docker run -d --name myapi -p 8787:8787 \
 ```bash
 npm run update-worker   # 拉上游最新 worker.js + 模型表（多镜像 + 重试 + 内容校验）
 npm run check           # 语法/导入自检
-npm test                # 102 项单测 + 72 项集成测试（会自己起一个临时服务）
+npm test                # 462 项：单测 167 + 协议适配器 154 + 协议端到端 69 + 集成 72
+                        # 会自己起一个假上游和一个临时服务，不碰真网络
 ```
 
 ---

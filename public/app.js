@@ -877,26 +877,42 @@ function renderAccounts(s) {
       const st = a.status;
       const tagClass = st ? (LAMP_BY_STATE[st.state] === 'ok' ? 'ok' : LAMP_BY_STATE[st.state] === 'bad' ? 'bad' : 'warn') : '';
       const label = st ? st.verdict : a.workerState ? `引擎观测 ${a.workerState.state}` : '未检测';
+      // 自定义上游的号只是一个 API key，没有邮箱也没有名字 —— 那就拿打码的 key 当标题，
+      // 显示"未知邮箱"只会让人以为出错了
+      const title = a.email || a.name || a.tokenMasked;
       return `<tr data-id="${a.id}" class="${a.enabled ? '' : 'is-off'}">
-      <td><div class="cell-main"><b>${esc(a.email || a.name || '未知邮箱')}</b>${a.active ? ' <span class="tag now">当前</span>' : ''}
+      <td><div class="cell-main"><b${a.email || a.name ? '' : ' class="cell-mono" style="font-weight:400"'}>${esc(title)}</b>${
+        a.active ? ' <span class="tag now">当前</span>' : ''
+      }
         <span class="cell-sub">${providerBadge(a.provider)} · ${esc(a.source)} · ${ago(a.createdAt)}加入</span></div></td>
       <td><select class="inline js-pool" title="${esc(POOL_FULL[a.pool] || '')}">
         ${Object.entries(POOL_FULL)
           .map(([v, t]) => `<option value="${v}"${a.pool === v ? ' selected' : ''}>${t}</option>`)
           .join('')}
       </select></td>
-      <td><span class="tag ${tagClass}" title="${esc(st?.detail || '点检测做一次 0 消耗探活')}">${esc(label)}</span></td>
+      <td><span class="tag ${tagClass}" title="${esc(st?.detail || '点检测做一次探活')}">${esc(label)}</span></td>
       <td class="cell-mono">${esc(st?.quota || '—')}</td>
-      <td class="cell-mono">${esc(a.tokenMasked)}</td>
+      <td class="cell-mono">${a.email || a.name ? esc(a.tokenMasked) : '—'}</td>
       <td class="acts">
         <button class="btn tiny js-check">检测</button>
-        <button class="btn tiny js-use"${a.active || !a.enabled ? ' disabled' : ''}>设为当前</button>
+        <button class="btn tiny js-use"${a.active || !a.enabled ? ' disabled' : ''} title="单号策略下用它">设为当前</button>
         <button class="btn tiny js-toggle">${a.enabled ? '停用' : '启用'}</button>
-        <button class="btn tiny js-token">复制 token</button>
-        <button class="btn tiny danger js-del">删除</button>
+        <button class="btn tiny js-token" title="复制完整凭据">复制</button>
+        <button class="btn tiny danger js-del" title="删除">✕</button>
       </td></tr>`;
     })
     .join('');
+
+  // 额度快照只有 freebuff 那类账号才有；筛到纯 API key 的上游时整列都是空的，
+  // 与其留一排横杠不如把列收起来
+  const anyQuota = rows.some((a) => a.status?.quota);
+  const anyToken = rows.some((a) => a.email || a.name);
+  $('.js-col-quota').classList.toggle('hidden', !anyQuota);
+  $('.js-col-token').classList.toggle('hidden', !anyToken);
+  $$('#acct-table tbody tr').forEach((tr) => {
+    tr.children[3]?.classList.toggle('hidden', !anyQuota);
+    tr.children[4]?.classList.toggle('hidden', !anyToken);
+  });
 
   $$('#acct-table tbody tr').forEach((tr) => {
     const id = tr.dataset.id;
