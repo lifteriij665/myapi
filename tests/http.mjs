@@ -255,8 +255,13 @@ const st2 = await admin('/state');
 KEY = st2.json.keys[0].key;
 const paused = st2.json.models.filter((m) => m.availability?.state === 'paused').map((m) => m.id);
 check('能识别出引擎屏蔽的模型', paused.length > 0, `paused=${JSON.stringify(paused)}`);
-const liveIds = (await (await raw('/v1/models', { headers: { authorization: `Bearer ${KEY}` } })).json()).data.map((m) => m.id);
-check('被暂停的模型不出现在 /v1/models', paused.every((id) => !liveIds.includes(id)), JSON.stringify(liveIds));
+const liveResp = await (await raw('/v1/models', { headers: { authorization: `Bearer ${KEY}` } })).json();
+const liveIds = (liveResp?.data || []).map((m) => m.id);
+check(
+  '被暂停的模型不出现在 /v1/models',
+  liveIds.length > 0 && paused.every((id) => !liveIds.includes(id)),
+  JSON.stringify(liveResp).slice(0, 200)
+);
 const pausedReq = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
