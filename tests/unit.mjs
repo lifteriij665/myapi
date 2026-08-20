@@ -93,9 +93,11 @@ store.data.settings.activeAccountId = 'a2';
 eq('钉住的号档位更低时不当起点（免费流量别去啃付费号）', selectOrder(FREE).order.map((a) => a.id), ['a3', 'a1', 'a2']);
 
 store.data.settings.autoSwitch = false;
-eq('手动模式只给钉住的那一个', selectOrder(FREE).order.map((a) => a.id), ['a2']);
+eq('单号模式只给钉住的那一个', selectOrder(FREE).order.map((a) => a.id), ['a2']);
 store.data.accounts[1].enabled = false;
-eq('手动模式下钉住的号被停用 → 空（请求应 503）', selectOrder(FREE).order.length, 0);
+// 钉住的号被停用时退到第一个可用的：直接 503 太糙了，新建一个单号上游还没点过
+// 「设为当前」就会全线不可用
+eq('单号模式下钉住的号被停用 → 退到第一个可用的', selectOrder(FREE).order.map((a) => a.id), ['a3']);
 store.data.accounts[1].enabled = true;
 store.data.settings.autoSwitch = true;
 
@@ -353,6 +355,143 @@ eq(
   { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 }
 );
 eq('c2a 流式：第一帧带 role', JSON.parse(c2aChunks[0]).choices[0].delta.role, 'assistant');
+
+// ─────────────────────────── 换号策略（五种，每个上游各一套、互不干扰）
+const ups = await import('../src/upstreams.js');
+const { setRotationRule, setRotationRules, rotationRule, addUpstream, removeUpstream, listUpstreams, normalizeBaseUrl } = ups;
+
+store.data.settings.rotationRules = {};
+store.data.settings.activeAccountId = null;
+store.data.accounts = [
+  { id: 'f1', email: 'a@x.com', token: 'tok-aaaa-1234567890', provider: 'freebuff', pool: 'any', enabled: true, status: null },
+  { id: 'f2', email: 'b@x.com', token: 'tok-bbbb-1234567890', provider: 'freebuff', pool: 'any', enabled: true, status: null },
+  { id: 'f3', email: 'c@x.com', token: 'tok-cccc-1234567890', provider: 'freebuff', pool: 'any', enabled: true, status: null },
+];
+
+eq('默认策略沿用老的 autoSwitch 语义（钉住用到失败）', rotationRule('freebuff').mode, 'exhaust');
+
+setRotationRule('freebuff', { mode: 'roundrobin' });
+ups.resetCursor('freebuff');
+const rr = [selectOrder(FREE).order[0].id, selectOrder(FREE).order[0].id, selectOrder(FREE).order[0].id, selectOrder(FREE).order[0].id];
+eq('轮询：每次请求换一个起点，绕回来', rr, ['f1', 'f2', 'f3', 'f1']);
+eq('轮询：order 是完整的一圈（失败还能顺延）', selectOrder(FREE).order.map((a) => a.id), ['f2', 'f3', 'f1']);
+
+setRotationRule('freebuff', { mode: 'random' });
+const randomStarts = new Set();
+for (let i = 0; i < 60; i++) randomStarts.add(selectOrder(FREE).order[0].id);
+eq('随机：多试几次能碰到不止一个起点', randomStarts.size > 1, true);
+eq('随机：order 长度还是全部号', selectOrder(FREE).order.length, 3);
+
+setRotationRule('freebuff', { mode: 'single', activeAccountId: 'f2' });
+eq('单号：只有指定的那一个', selectOrder(FREE).order.map((a) => a.id), ['f2']);
+eq('单号：manual 标记为真（engine 据此不换号）', selectOrder(FREE).manual, true);
+
+setRotationRule('freebuff', { mode: 'exhaust', activeAccountId: 'f3' });
+eq('额度用完才换：从钉住的号开始顺延', selectOrder(FREE).order.map((a) => a.id), ['f3', 'f1', 'f2']);
+eq('额度用完才换：manual 为假', selectOrder(FREE).manual, false);
+
+setRotationRule('freebuff', { mode: 'onerror', activeAccountId: 'f1' });
+eq('一出错就换：顺序和 exhaust 一样（区别在重试判定）', selectOrder(FREE).order.map((a) => a.id), ['f1', 'f2', 'f3']);
+eq('mode 透出给 engine', selectOrder(FREE).mode, 'onerror');
+
+// 每个上游互不干扰
+store.data.accounts.push(
+  { id: 'o1', name: 'z1', token: 'sk-zen-aaaaaaaaaaaa', provider: 'opencode', pool: 'free', enabled: true, status: null },
+  { id: 'o2', name: 'z2', token: 'sk-zen-bbbbbbbbbbbb', provider: 'opencode', pool: 'free', enabled: true, status: null }
+);
+setRotationRule('freebuff', { mode: 'single', activeAccountId: 'f2' });
+setRotationRule('opencode', { mode: 'roundrobin' });
+ups.resetCursor('opencode');
+eq('freebuff 设成单号不影响 opencode', selectOrder(FREE).order.map((a) => a.id), ['f2']);
+eq('opencode 自己走轮询', [selectOrder(OC_FREE).order[0].id, selectOrder(OC_FREE).order[0].id], ['o1', 'o2']);
+eq('两个上游的策略各自独立存着', [rotationRule('freebuff').mode, rotationRule('opencode').mode], ['single', 'roundrobin']);
+
+// 一键应用：一次把同一个策略套到多个上游
+setRotationRules(['freebuff', 'opencode'], 'exhaust');
+eq('一键应用：两个上游都变了', [rotationRule('freebuff').mode, rotationRule('opencode').mode], ['exhaust', 'exhaust']);
+eq('一键应用：不传上游列表就套用到全部', setRotationRules(null, 'random').length >= 2, true);
+eq('一键应用：非法策略名被拒', (() => { try { setRotationRules(['freebuff'], 'nope'); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+setRotationRule('freebuff', { mode: 'exhaust' });
+setRotationRule('opencode', { mode: 'exhaust' });
+
+// ─────────────────────────── 自定义上游
+eq('base URL 补全协议并去掉尾斜杠', normalizeBaseUrl('api.example.com/v1/'), 'https://api.example.com/v1');
+eq('base URL 拒绝内网地址（防 SSRF）', (() => { try { normalizeBaseUrl('http://127.0.0.1:8080'); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+eq('base URL 拒绝云元数据地址', (() => { try { normalizeBaseUrl('http://169.254.169.254/latest'); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+eq('base URL 拒绝非 http 协议', (() => { try { normalizeBaseUrl('ftp://example.com'); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+eq('协议格式必须是四种之一', (() => { try { addUpstream({ name: 'x', format: 'grpc', baseUrl: 'https://a.com' }); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+
+store.data.upstreams = [];
+const myUp = addUpstream({ name: 'My Relay', format: 'responses', baseUrl: 'https://relay.example.com/v1', models: ['gpt-4o', 'gpt-4o-mini'] });
+eq('自定义上游的 id 形状', /^up_[a-f0-9]{8}$/.test(myUp.id), true);
+eq('自定义上游默认按付费处理（fail-closed）', myUp.defaultTier, 'paid');
+eq('重名被拒', (() => { try { addUpstream({ name: 'My Relay', format: 'chat', baseUrl: 'https://b.com' }); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+
+const mdl = await import('../src/models.js');
+const MY_MODEL = 'my-relay/gpt-4o';
+eq('模型 id 带上游名前缀', mdl.withUpstreamPrefix(myUp, 'gpt-4o'), MY_MODEL);
+eq('上游名里的空格收敛成连字符', mdl.upstreamSlug('My Relay'), 'my-relay');
+eq('按模型 id 找回上游', mdl.upstreamForModel(MY_MODEL)?.id, myUp.id);
+eq('清单里没有的模型不算这个上游的', mdl.upstreamForModel('my-relay/not-listed'), null);
+eq('去前缀拿到上游认的裸名', mdl.stripUpstreamPrefix(MY_MODEL, myUp), 'gpt-4o');
+eq('模型 → 上游 id', mdl.providerForModel(MY_MODEL), myUp.id);
+eq('自定义上游的模型算已知', mdl.isKnownModel(MY_MODEL), true);
+eq('自定义上游的模型默认按付费', mdl.tierOf(MY_MODEL), 'paid');
+eq('resolveModelId 不会被 freebuff 的后缀匹配抢走', mdl.resolveModelId(MY_MODEL), MY_MODEL);
+eq('免费 key 用不了自定义上游的模型', mdl.checkModelAccess({ allowPaid: false, models: [] }, MY_MODEL).status, 403);
+eq('勾了付费就能用', mdl.checkModelAccess({ allowPaid: true, models: [] }, MY_MODEL).ok, true);
+eq('目录里能看到自定义上游的模型', mdl.catalog().filter((m) => m.provider === myUp.id).map((m) => m.id).sort(), ['my-relay/gpt-4o', 'my-relay/gpt-4o-mini']);
+eq('目录条目带上游名和协议', (() => { const m = mdl.catalog().find((x) => x.id === MY_MODEL); return [m.providerName, m.pool]; })(), ['My Relay', 'responses']);
+
+// 整个上游标成免费之后，免费 key 就能用了
+ups.updateUpstream(myUp.id, { defaultTier: 'free' });
+eq('上游改成免费后 tier 跟着变', mdl.tierOf(MY_MODEL), 'free');
+eq('免费 key 这时可以用', mdl.checkModelAccess({ allowPaid: false, models: [] }, MY_MODEL).ok, true);
+ups.updateUpstream(myUp.id, { defaultTier: 'paid' });
+
+// 停用的上游：模型不再对外提供
+ups.updateUpstream(myUp.id, { enabled: false });
+eq('停用后 checkModelAccess 给 503', mdl.checkModelAccess({ allowPaid: true, models: [] }, MY_MODEL).status, 503);
+eq('停用后不出现在 /v1/models', mdl.filterModelList({ allowPaid: true, models: [] }, [{ id: MY_MODEL }]).length, 0);
+ups.updateUpstream(myUp.id, { enabled: true });
+
+// 这个上游的号只服务它自己的模型
+store.data.accounts.push(
+  { id: 'c1', name: 'k1', token: 'sk-relay-aaaaaaaaaaaa', provider: myUp.id, pool: 'any', enabled: true, status: null },
+  { id: 'c2', name: 'k2', token: 'sk-relay-bbbbbbbbbbbb', provider: myUp.id, pool: 'any', enabled: true, status: null }
+);
+eq('自定义上游的模型只用它自己的号', selectOrder(MY_MODEL).order.map((a) => a.id), ['c1', 'c2']);
+eq('freebuff 的模型不会用到自定义上游的号', selectOrder(FREE).order.every((a) => a.id.startsWith('f')), true);
+setRotationRule(myUp.id, { mode: 'roundrobin' });
+ups.resetCursor(myUp.id);
+eq('自定义上游也能独立设策略', [selectOrder(MY_MODEL).order[0].id, selectOrder(MY_MODEL).order[0].id], ['c1', 'c2']);
+eq('设了自定义上游的策略不影响 freebuff', rotationRule('freebuff').mode, 'exhaust');
+
+// 删上游：名下的号一起清掉，别留孤儿
+const gone = removeUpstream(myUp.id);
+eq('删上游连它的号一起删', gone.removedAccounts, 2);
+eq('删完 store 里没有这个上游了', listUpstreams().some((u) => u.id === myUp.id), false);
+eq('删完那些号也不在了', store.data.accounts.some((a) => a.provider === myUp.id), false);
+eq('删完它的策略也清掉了', Object.hasOwn(store.data.settings.rotationRules || {}, myUp.id), false);
+store.data.upstreams = [];
+
+// ─────────────────────────── 协议适配器注册表
+const proto = await import('../src/protocols/index.js');
+eq('四种格式都有适配器', ['chat', 'responses', 'anthropic', 'gemini'].map((f) => proto.knownFormat(f)), [true, true, true, true]);
+eq('不认识的格式回落到 chat', proto.adapterFor('grpc').FORMAT, 'chat');
+eq('chat 适配器是恒等变换', proto.adapterFor('chat').requestFromChat({ messages: [{ role: 'user', content: 'hi' }] }, 'm').model, 'm');
+eq('chat 适配器不需要流式转换', proto.adapterFor('chat').createStreamToChat('m'), null);
+eq('anthropic 适配器用 x-api-key 并带版本号', proto.adapterFor('anthropic').authHeaders('sk-1'), { 'x-api-key': 'sk-1', 'anthropic-version': '2023-06-01' });
+eq('gemini 适配器用 x-goog-api-key', proto.adapterFor('gemini').authHeaders('k'), { 'x-goog-api-key': 'k' });
+eq('responses 适配器用 Bearer', proto.adapterFor('responses').authHeaders('sk-2'), { authorization: 'Bearer sk-2' });
+eq('各协议的端点', ['chat', 'responses', 'anthropic'].map((f) => proto.adapterFor(f).upstreamPath('m', false)), ['/chat/completions', '/responses', '/messages']);
+eq('gemini 流式和非流式端点不同', [proto.adapterFor('gemini').upstreamPath('gemini-3-flash', false), proto.adapterFor('gemini').upstreamPath('gemini-3-flash', true)], ['/models/gemini-3-flash:generateContent', '/models/gemini-3-flash:streamGenerateContent?alt=sse']);
+eq('上游失败归类：401 → token 失效', proto.classifyUpstreamFailure(401, ''), 'token_invalid');
+eq('上游失败归类：429 + 余额字样 → 余额不足', proto.classifyUpstreamFailure(429, 'insufficient balance'), 'no_credit');
+eq('上游失败归类：429 → 限流', proto.classifyUpstreamFailure(429, 'too many requests'), 'rate_limited');
+eq('上游失败归类：403 + 地区字样 → 地区受限', proto.classifyUpstreamFailure(403, 'unsupported_country_region'), 'country_blocked');
+eq('上游失败归类：402 → 余额不足', proto.classifyUpstreamFailure(402, ''), 'no_credit');
+eq('上游失败归类：500 → 上游失败', proto.classifyUpstreamFailure(500, 'oops'), 'upstream_error');
 
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

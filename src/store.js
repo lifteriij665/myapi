@@ -10,8 +10,18 @@ import { randomId, generateApiKey, nowIso, constantTimeEqual } from './util.js';
 const scryptAsync = promisify(scrypt);
 const CURRENT_VERSION = 1;
 
-// 号池支持的上游。'freebuff' 走 vendor/worker.js，'opencode' 直连 opencode.ai/zen。
+// 内置上游。'freebuff' 走 vendor/worker.js，'opencode' 直连 opencode.ai/zen。
+// 除这两个之外，用户还能在控制台加任意多个自定义上游（见 src/upstreams.js），
+// 它们的 id 形如 'up_xxxx'，也会出现在 account.provider 上。
 export const PROVIDERS = ['freebuff', 'opencode'];
+
+const CUSTOM_ID_RE = /^up_[a-f0-9]{8}$/;
+
+/** 这个字符串能不能当 provider 用（内置的两个，或者自定义上游的 id 形状） */
+export function isProviderId(value) {
+  const p = String(value || '');
+  return PROVIDERS.includes(p) || CUSTOM_ID_RE.test(p);
+}
 
 /**
  * 账号属于哪个上游。老数据文件里的账号没有 provider 字段，一律当 freebuff ——
@@ -20,12 +30,14 @@ export const PROVIDERS = ['freebuff', 'opencode'];
  */
 export function providerOf(account) {
   const p = account?.provider;
-  return PROVIDERS.includes(p) ? p : 'freebuff';
+  return isProviderId(p) ? p : 'freebuff';
 }
 
 export function normalizeProvider(value) {
-  const p = String(value || '').trim().toLowerCase();
-  return PROVIDERS.includes(p) ? p : 'freebuff';
+  const p = String(value || '').trim();
+  if (isProviderId(p)) return p;
+  const lower = p.toLowerCase();
+  return PROVIDERS.includes(lower) ? lower : 'freebuff';
 }
 
 function emptyData() {
@@ -50,6 +62,9 @@ function emptyData() {
       hideUnavailableModels: true,
       // 客户端不写 model 时用哪个；留空＝自动挑当前不限量的那一档
       defaultModel: '',
+      // 每个上游一份换号策略：providerId -> { mode, activeAccountId }
+      // 见 src/upstreams.js。缺省时按老的 autoSwitch 开关翻译，升级不改行为。
+      rotationRules: {},
       // 聊天记录留存（默认关）
       chatLogEnabled: false,
       chatLogMaxMB: 200,
@@ -57,6 +72,8 @@ function emptyData() {
     },
     // 模型实测状态：id -> { state, at, detail, fails }
     modelStatus: {},
+    // 自定义上游（内置那两个不在这里，见 src/upstreams.js 的 BUILTIN）
+    upstreams: [],
     accounts: [],
     keys: [],
   };
@@ -82,7 +99,8 @@ class Store {
         this.data.settings = { ...emptyData().settings, ...(parsed.settings || {}) };
         this.data.accounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
         // 老数据文件里的账号没有 provider，补成 freebuff（这个版本之前只有那一个上游）
-        for (const a of this.data.accounts) if (!PROVIDERS.includes(a?.provider)) a.provider = 'freebuff';
+        for (const a of this.data.accounts) if (!isProviderId(a?.provider)) a.provider = 'freebuff';
+        this.data.upstreams = Array.isArray(parsed.upstreams) ? parsed.upstreams : [];
         this.data.keys = Array.isArray(parsed.keys) ? parsed.keys : [];
         this.data.modelStatus = parsed.modelStatus && typeof parsed.modelStatus === 'object' ? parsed.modelStatus : {};
       } catch (err) {
@@ -476,6 +494,17 @@ class Store {
       s.activeAccountId = id && this.data.accounts.some((a) => a.id === id) ? id : null;
     }
     if (Array.isArray(patch.disabledModels)) s.disabledModels = patch.disabledModels.map(String);
+    if (patch.rotationRules && typeof patch.rotationRules === 'object') {
+      // 值的形状由 upstreams.js 校验过；这里只保证是个对象，别把整棵设置写坏
+      s.rotationRules = {};
+      for (const [id, rule] of Object.entries(patch.rotationRules)) {
+        if (!rule || typeof rule !== 'object') continue;
+        s.rotationRules[String(id)] = {
+          ...(rule.mode ? { mode: String(rule.mode) } : {}),
+          ...(rule.activeAccountId ? { activeAccountId: String(rule.activeAccountId) } : {}),
+        };
+      }
+    }
     if (patch.modelTierOverrides && typeof patch.modelTierOverrides === 'object') {
       s.modelTierOverrides = {};
       for (const [id, tier] of Object.entries(patch.modelTierOverrides)) {
@@ -490,6 +519,7 @@ class Store {
     return {
       exportedAt: nowIso(),
       settings: this.data.settings,
+      upstreams: this.data.upstreams || [],
       accounts: this.data.accounts.map(({ status, ...rest }) => rest),
       keys: this.data.keys,
     };
@@ -497,10 +527,29 @@ class Store {
 
   importData(payload, { replace = false } = {}) {
     if (!payload || typeof payload !== 'object') throw Object.assign(new Error('导入内容格式不对'), { statusCode: 400 });
-    const result = { accounts: 0, keys: 0 };
+    const result = { accounts: 0, keys: 0, upstreams: 0 };
     if (replace) {
       this.data.accounts = [];
       this.data.keys = [];
+      this.data.upstreams = [];
+    }
+    // 上游要先导：账号的 provider 指向它，顺序反了会让号变成孤儿
+    if (!Array.isArray(this.data.upstreams)) this.data.upstreams = [];
+    for (const u of Array.isArray(payload.upstreams) ? payload.upstreams : []) {
+      if (!u?.id || !u?.baseUrl || this.data.upstreams.some((x) => x.id === u.id)) continue;
+      this.data.upstreams.push({
+        id: String(u.id),
+        name: String(u.name || u.id),
+        format: ['chat', 'responses', 'anthropic', 'gemini'].includes(u.format) ? u.format : 'chat',
+        baseUrl: String(u.baseUrl),
+        note: String(u.note || '').slice(0, 200),
+        enabled: u.enabled !== false,
+        defaultTier: u.defaultTier === 'free' ? 'free' : 'paid',
+        models: Array.isArray(u.models) ? u.models.map(String) : [],
+        modelsFetchedAt: u.modelsFetchedAt || null,
+        createdAt: u.createdAt || nowIso(),
+      });
+      result.upstreams++;
     }
     for (const a of Array.isArray(payload.accounts) ? payload.accounts : []) {
       if (!a?.token) continue;

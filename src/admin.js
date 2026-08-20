@@ -8,6 +8,21 @@ import { callWorker, eligibleAccounts, workerHealth } from './engine.js';
 import { probeAccount } from './probe.js';
 import { probeOpencodeKey, callOpencode } from './opencode.js';
 import { isOpencodeModel, stripPrefix } from './models-opencode.js';
+import {
+  upstreamViews,
+  addUpstream,
+  updateUpstream,
+  removeUpstream,
+  getUpstream,
+  addUpstreamModels,
+  removeUpstreamModel,
+  setRotationRule,
+  setRotationRules,
+  FORMAT_LABEL,
+  ROTATION_LABEL,
+  ROTATION_HINT,
+} from './upstreams.js';
+import { fetchUpstreamModels, probeUpstreamKey } from './protocols/index.js';
 import { startFlow, getFlow, cancelFlow, publicFlow, startOpencodeFlow, finishOpencodeFlow } from './login-flow.js';
 import { browserFeature, startBrowserForFlow, getSession } from './browser.js';
 import { usage } from './usage.js';
@@ -132,10 +147,14 @@ function keyView(k) {
   };
 }
 
-/** 探活：两个上游的凭据格式和校验方式都不一样，按 provider 分流 */
+/** 探活：每个上游的凭据格式和校验方式都不一样，按 provider 分流 */
 async function checkAccount(acct) {
-  if (providerOf(acct) === 'opencode') return probeOpencodeKey(acct.token);
-  return probeAccount(acct.token);
+  const prov = providerOf(acct);
+  if (prov === 'opencode') return probeOpencodeKey(acct.token);
+  if (prov === 'freebuff') return probeAccount(acct.token);
+  const up = getUpstream(prov);
+  if (!up) return { state: 'unknown', verdict: '上游已删除', detail: '这个号所属的上游不在了，删掉它吧', httpStatus: 0 };
+  return probeUpstreamKey(up, acct.token);
 }
 
 async function liveModelIds() {
@@ -222,6 +241,10 @@ async function buildState(req) {
     defaultModel: defaultModel({ hasFreebuff: store.accounts.some((a) => a.enabled && providerOf(a) === 'freebuff') }),
     providers: {
       counts: byProvider,
+      list: upstreamViews(),
+      formats: FORMAT_LABEL,
+      rotations: ROTATION_LABEL,
+      rotationHints: ROTATION_HINT,
       opencode: {
         base: config.opencodeBase,
         anonymous: config.opencodeAnonymous,
@@ -679,6 +702,151 @@ export async function handleAdminApi(req, res, url) {
     const body = await readJson(req, 8 * 1024);
     store.clearModelStatus(body.id ? String(body.id) : null);
     return sendJson(res, 200, { ok: true });
+  }
+
+  // --- 自定义上游 ---
+  if (path === '/upstreams' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, upstreams: upstreamViews(), formats: FORMAT_LABEL, rotations: ROTATION_LABEL, rotationHints: ROTATION_HINT });
+  }
+
+  if (path === '/upstreams' && method === 'POST') {
+    const body = await readJson(req, 64 * 1024);
+    let up;
+    try {
+      up = addUpstream(body);
+    } catch (err) {
+      return sendJson(res, err.statusCode || 400, { ok: false, error: err.message });
+    }
+    // 顺手把一起提交的 key 加进号池（一行一个，支持一次贴几十个）
+    const added = [];
+    for (const raw of String(body.keys || '').split(/[\s,]+/)) {
+      const token = raw.trim();
+      if (token.length <= 8) continue;
+      try {
+        const { account } = store.addAccount({ token, provider: up.id, pool: up.defaultTier === 'free' ? 'free' : 'any', source: 'manual' });
+        added.push(account.id);
+      } catch {
+        /* 单个 key 不合格就跳过，不要让整批失败 */
+      }
+    }
+    return sendJson(res, 200, { ok: true, upstream: up, addedKeys: added.length });
+  }
+
+  const upMatch = path.match(/^\/upstreams\/([\w-]+)(\/models|\/models\/fetch|\/keys|\/rotation|\/check)?$/);
+  if (upMatch) {
+    const id = upMatch[1];
+    const up = getUpstream(id);
+    if (!up) return sendJson(res, 404, { ok: false, error: '上游不存在' });
+    const action = upMatch[2] || '';
+
+    if (action === '/rotation' && method === 'POST') {
+      const body = await readJson(req, 16 * 1024);
+      try {
+        const rule = setRotationRule(id, body);
+        return sendJson(res, 200, { ok: true, rotation: rule });
+      } catch (err) {
+        return sendJson(res, err.statusCode || 400, { ok: false, error: err.message });
+      }
+    }
+
+    // 用池子里的 key 去问上游要模型列表
+    if (action === '/models/fetch' && method === 'POST') {
+      if (up.builtin) return sendJson(res, 400, { ok: false, error: '内置上游的模型表是自动维护的，不用手动拉' });
+      const keys = store.accounts.filter((a) => providerOf(a) === id && a.enabled !== false);
+      if (!keys.length) return sendJson(res, 400, { ok: false, error: '这个上游还没有 API key，先加一个再拉模型' });
+      let ids = null;
+      let tried = 0;
+      // 依次试，直到有一个 key 能拉到（有的 key 可能已经废了）
+      for (const acct of keys) {
+        tried++;
+        ids = await fetchUpstreamModels(up, acct.token).catch(() => null);
+        if (ids?.length) break;
+      }
+      if (!ids?.length) {
+        return sendJson(res, 502, {
+          ok: false,
+          error: `试了 ${tried} 个 key 都没拉到模型列表（这个上游可能没实现 /models 接口）—— 直接手动填模型名即可`,
+        });
+      }
+      addUpstreamModels(id, ids, { replace: true });
+      return sendJson(res, 200, { ok: true, models: ids, count: ids.length });
+    }
+
+    // 手动增删模型
+    if (action === '/models' && method === 'POST') {
+      const body = await readJson(req, 64 * 1024);
+      const list = Array.isArray(body.models) ? body.models : String(body.models || '').split(/[\s,]+/);
+      const clean = list.map((s) => String(s).trim()).filter(Boolean);
+      if (!clean.length) return sendJson(res, 400, { ok: false, error: '没解析出模型名' });
+      const next = addUpstreamModels(id, clean, { replace: Boolean(body.replace) });
+      return sendJson(res, 200, { ok: true, models: next.models });
+    }
+    if (action === '/models' && method === 'DELETE') {
+      const body = await readJson(req, 16 * 1024);
+      const next = removeUpstreamModel(id, String(body.model || ''));
+      return sendJson(res, 200, { ok: true, models: next?.models || [] });
+    }
+
+    // 批量加 key
+    if (action === '/keys' && method === 'POST') {
+      const body = await readJson(req, 512 * 1024);
+      const tokens = String(body.keys || body.token || '').split(/[\s,]+/).map((t) => t.trim()).filter((t) => t.length > 8);
+      if (!tokens.length) return sendJson(res, 400, { ok: false, error: '没解析出有效的 API key' });
+      const pool = body.pool || (up.defaultTier === 'free' ? 'free' : 'any');
+      const added = [];
+      let skipped = 0;
+      for (const token of tokens) {
+        try {
+          const before = store.accounts.length;
+          const { account } = store.addAccount({ token, provider: id, pool, source: 'manual' });
+          if (store.accounts.length === before) skipped++;
+          added.push(account.id);
+        } catch {
+          skipped++;
+        }
+      }
+      return sendJson(res, 200, { ok: true, added: added.length, skipped, ids: added });
+    }
+
+    // 逐个探活这个上游名下的 key
+    if (action === '/check' && method === 'POST') {
+      const accounts = store.accounts.filter((a) => providerOf(a) === id);
+      const results = [];
+      for (const acct of accounts) {
+        const result = await checkAccount(acct);
+        store.setAccountStatus(acct.id, result);
+        results.push({ id: acct.id, ...result });
+      }
+      return sendJson(res, 200, { ok: true, results });
+    }
+
+    if (method === 'PATCH') {
+      try {
+        const next = updateUpstream(id, await readJson(req, 64 * 1024));
+        return sendJson(res, 200, { ok: true, upstream: next });
+      } catch (err) {
+        return sendJson(res, err.statusCode || 400, { ok: false, error: err.message });
+      }
+    }
+    if (method === 'DELETE') {
+      if (up.builtin) return sendJson(res, 400, { ok: false, error: '内置上游不能删' });
+      const r = removeUpstream(id);
+      return sendJson(res, 200, { ok: true, removedAccounts: r?.removedAccounts || 0 });
+    }
+    if (method === 'GET') {
+      return sendJson(res, 200, { ok: true, upstream: upstreamViews().find((u) => u.id === id) || null });
+    }
+  }
+
+  // 批量套用同一个换号策略（控制台的「一键应用」）
+  if (path === '/rotation/bulk' && method === 'POST') {
+    const body = await readJson(req, 16 * 1024);
+    try {
+      const applied = setRotationRules(body.providers, body.mode);
+      return sendJson(res, 200, { ok: true, applied, mode: body.mode });
+    } catch (err) {
+      return sendJson(res, err.statusCode || 400, { ok: false, error: err.message });
+    }
   }
 
   // ADMIN_ROUTES_MARKER

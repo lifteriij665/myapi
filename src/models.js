@@ -27,6 +27,83 @@ import {
   nativeProtocol,
 } from './models-opencode.js';
 import { fetchOpencodeModels } from './opencode.js';
+import { listUpstreams, getUpstream } from './upstreams.js';
+
+// ─────────────────────────── 自定义上游的模型
+//
+// id 形如 `<上游名>/<模型名>`，和 opencode 的 `opencode/xxx` 一个套路：
+// 用前缀把不同上游隔开，避免两家都叫 gpt-4o 时撞车。
+// 前缀取上游的 name（人看得懂），映射到 id 由 upstreamForModel 负责。
+
+/** 上游名里可能有空格之类，做成前缀时统一收敛成安全字符 */
+export function upstreamSlug(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'upstream';
+}
+
+/** 'myrelay/gpt-4o' → 那个上游对象；找不到返回 null */
+export function upstreamForModel(modelId) {
+  const raw = String(modelId || '');
+  const slash = raw.indexOf('/');
+  if (slash <= 0) return null;
+  const prefix = raw.slice(0, slash).toLowerCase();
+  for (const u of listUpstreams()) {
+    if (u.builtin) continue;
+    if (upstreamSlug(u.name) === prefix && (u.models || []).includes(raw.slice(slash + 1))) return u;
+  }
+  return null;
+}
+
+/** 去掉前缀，拿到上游认的裸模型名 */
+export function stripUpstreamPrefix(modelId, upstream) {
+  const raw = String(modelId || '');
+  const prefix = upstreamSlug(upstream?.name) + '/';
+  return raw.toLowerCase().startsWith(prefix) ? raw.slice(prefix.length) : raw;
+}
+
+export function withUpstreamPrefix(upstream, bareId) {
+  return `${upstreamSlug(upstream?.name)}/${bareId}`;
+}
+
+/** 所有自定义上游的模型条目（控制台目录和 /v1/models 都用它） */
+export function customCatalog() {
+  const out = [];
+  for (const u of listUpstreams()) {
+    if (u.builtin || u.enabled === false) continue;
+    for (const bare of u.models || []) {
+      out.push({
+        id: withUpstreamPrefix(u, bare),
+        bare,
+        upstreamId: u.id,
+        upstreamName: u.name,
+        format: u.format,
+        tier: u.defaultTier === 'free' ? 'free' : 'paid',
+      });
+    }
+  }
+  return out;
+}
+
+export function customModelList() {
+  return customCatalog().map((m) => ({ id: m.id, object: 'model', created: 0, owned_by: m.upstreamName }));
+}
+
+function customEntry(modelId) {
+  const u = upstreamForModel(modelId);
+  if (!u) return null;
+  const bare = stripUpstreamPrefix(modelId, u);
+  return {
+    id: modelId,
+    bare,
+    upstreamId: u.id,
+    upstreamName: u.name,
+    format: u.format,
+    tier: u.defaultTier === 'free' ? 'free' : 'paid',
+  };
+}
 
 const RELEASE_SOURCES = [
   'https://github.com/pingmike2/freebuff2api-wokers/releases/latest/download/freebuff-models.json',
@@ -178,6 +255,9 @@ export function tierOf(modelId) {
   if (override === 'free' || override === 'paid') return override;
   // opencode Zen：免费/付费是上游明码标价的，按它自己的名单判
   if (isOpencodeModel(modelId)) return isFreeOpencodeModel(modelId) ? 'free' : 'paid';
+  // 自定义上游：整个上游一个默认档（用户自己知道那个 key 要不要钱）
+  const custom = customEntry(modelId);
+  if (custom) return custom.tier;
   if (table.premium.has(modelId)) return 'paid';
   if (table.standard.has(modelId) || table.glm.has(modelId)) return 'free';
   // 未分类模型：保守当付费处理，免得没勾「允许付费」的 key 把 premium 额度烧掉。
@@ -185,13 +265,17 @@ export function tierOf(modelId) {
   return 'paid';
 }
 
-/** 这个模型该找哪个上游？'opencode' | 'freebuff' */
+/** 这个模型该找哪个上游？'opencode' | 'freebuff' | 'up_xxxx' */
 export function providerForModel(modelId) {
-  return isOpencodeModel(modelId) ? 'opencode' : 'freebuff';
+  if (isOpencodeModel(modelId)) return 'opencode';
+  const u = upstreamForModel(modelId);
+  if (u) return u.id;
+  return 'freebuff';
 }
 
 export function isKnownModel(modelId) {
   if (isOpencodeModel(modelId)) return hasOpencodeModel(modelId);
+  if (upstreamForModel(modelId)) return true;
   return table.models.has(modelId);
 }
 
@@ -212,6 +296,13 @@ export function isLimitedOffer(modelId) {
 
 export function noteOf(modelId) {
   if (isOpencodeModel(modelId)) return opencodeNote(modelId);
+  const custom = customEntry(modelId);
+  if (custom) {
+    const u = getUpstream(custom.upstreamId);
+    return `自定义上游「${custom.upstreamName}」（${custom.format}）${u?.note ? ` · ${u.note}` : ''}${
+      custom.tier === 'paid' ? ' · 按付费处理，需要 key 勾选「允许付费」' : ' · 已标为免费'
+    }`;
+  }
   const lim = table.limits || {};
   if (isDeepSeekFamily(modelId) && table.premium.has(modelId)) {
     return `DeepSeek 家族：Flash 和 Pro 共用每天 ${lim.deepseek || 1} 次 session，而且这一次还照样扣 Premium 额度 —— 全池里最紧的`;
@@ -335,6 +426,11 @@ export function availabilityOf(modelId) {
       at: null,
     };
   }
+  if (upstreamForModel(modelId)) {
+    const st = store.modelStatus?.[modelId];
+    if (st) return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
+    return { state: 'listed', detail: '自定义上游的模型清单里有它（还没实测过）', at: null };
+  }
   const st = store.modelStatus?.[modelId];
   if (!st) return { state: 'unverified', detail: '只在上游模型表里出现过，还没实测', at: null };
   return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
@@ -342,41 +438,51 @@ export function availabilityOf(modelId) {
 
 /** 控制台用的完整目录（可传入 worker /v1/models 返回的 id 列表做合并） */
 export function catalog(extraIds = []) {
-  const ids = new Set([...table.models.keys(), ...extraIds, ...ocTable.keys()]);
+  const custom = customCatalog();
+  const customById = new Map(custom.map((m) => [m.id, m]));
+  const ids = new Set([...table.models.keys(), ...extraIds, ...ocTable.keys(), ...customById.keys()]);
   const disabled = new Set(store.settings?.disabledModels || []);
+  // 上游展示顺序：内置两个在前，自定义按名字排
+  const order = new Map(listUpstreams().map((u, i) => [u.id, i]));
   return [...ids]
     .map((id) => {
       const oc = isOpencodeModel(id) ? opencodeEntry(id) : null;
+      const cu = customById.get(id) || null;
       return {
         id,
-        provider: oc ? 'opencode' : 'freebuff',
+        provider: oc ? 'opencode' : cu ? cu.upstreamId : 'freebuff',
+        providerName: oc ? 'opencode Zen' : cu ? cu.upstreamName : 'freebuff',
         tier: tierOf(id),
         pool: oc
           ? oc.free
             ? 'zen-free'
             : 'zen-paid'
-          : table.premium.has(id)
-            ? 'premium'
-            : table.glm.has(id)
-              ? 'glm'
-              : table.standard.has(id)
-                ? 'standard'
-                : 'unknown',
+          : cu
+            ? cu.format
+            : table.premium.has(id)
+              ? 'premium'
+              : table.glm.has(id)
+                ? 'glm'
+                : table.standard.has(id)
+                  ? 'standard'
+                  : 'unknown',
         note: noteOf(id),
         agent: table.models.get(id)?.agent || '',
         enabled: !disabled.has(id),
         overridden: Boolean(store.settings?.modelTierOverrides?.[id]),
         availability: availabilityOf(id),
         limitedOffer: oc ? false : isLimitedOffer(id),
-        deepseekFamily: oc ? false : isDeepSeekFamily(id),
-        displayName: oc ? oc.displayName : table.models.get(id)?.displayName || '',
-        upstreamAvailability: oc ? '' : table.models.get(id)?.availability || '',
-        closedWindowUtc: oc ? '' : table.models.get(id)?.closedWindowUtc || '',
+        deepseekFamily: oc || cu ? false : isDeepSeekFamily(id),
+        displayName: oc ? oc.displayName : cu ? cu.bare : table.models.get(id)?.displayName || '',
+        upstreamAvailability: oc || cu ? '' : table.models.get(id)?.availability || '',
+        closedWindowUtc: oc || cu ? '' : table.models.get(id)?.closedWindowUtc || '',
       };
     })
     .sort((a, b) => {
-      // 先按上游分组，组内免费在前，再按 id
-      if (a.provider !== b.provider) return a.provider === 'freebuff' ? -1 : 1;
+      // 先按上游分组（内置在前），组内免费在前，再按 id
+      const oa = order.has(a.provider) ? order.get(a.provider) : 99;
+      const ob = order.has(b.provider) ? order.get(b.provider) : 99;
+      if (oa !== ob) return oa - ob;
       if (a.tier !== b.tier) return a.tier === 'free' ? -1 : 1;
       return a.id.localeCompare(b.id);
     });
@@ -390,6 +496,7 @@ export function catalogMeta() {
     count: table.models.size,
     limits: table.limits || null,
     opencode: { count: ocTable.size, lastRefresh: ocLastRefresh },
+    custom: { count: customCatalog().length },
   };
 }
 
@@ -451,6 +558,26 @@ export function checkModelAccess(keyRecord, modelId) {
     }
     return { ok: true };
   }
+  // 自定义上游：模型清单是用户自己维护的，所以"在清单里"就算存在
+  const custom = customEntry(modelId);
+  if (custom) {
+    if (disabled.has(modelId)) return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
+    const up = getUpstream(custom.upstreamId);
+    if (!up || up.enabled === false) {
+      return { ok: false, status: 503, message: `上游「${custom.upstreamName}」已停用，去控制台重新启用或换一个模型` };
+    }
+    if (keyRecord?.models?.length && !keyRecord.models.includes(modelId)) {
+      return { ok: false, status: 403, message: `当前 API key 未授权模型 ${modelId}` };
+    }
+    if (custom.tier === 'paid' && !keyRecord?.allowPaid) {
+      return {
+        ok: false,
+        status: 403,
+        message: `模型 ${modelId} 属于自定义上游「${custom.upstreamName}」，默认按付费处理；当前 API key 没有勾选「允许付费模型」。确认这个上游不花钱的话，可以在控制台把它的默认分类改成免费。`,
+      };
+    }
+    return { ok: true };
+  }
   if (modelId && enginePaused.has(modelId)) {
     return {
       ok: false,
@@ -491,12 +618,20 @@ export function resolveModelId(raw, isAnthropic = false) {
     const full = withPrefix(stripPrefix(value));
     return ocTable.has(full) ? full : value;
   }
+  // 自定义上游的 `<上游>/<模型>`：命中就直接用，不要再往下做后缀匹配 ——
+  // 否则一个叫 openai/gpt-4o 的自定义模型会被 freebuff 的后缀匹配抢走
+  if (upstreamForModel(value)) return value;
   // 裸的 opencode 模型名（mimo-v2.5-free 这种）也认：它们不含 '/'，
   // 和 freebuff 的 'vendor/model' 形态天然不会撞
   if (!value.includes('/') && ocTable.has(OPENCODE_PREFIX + value)) return OPENCODE_PREFIX + value;
   const short = value.replace(/^anthropic\//i, '').toLowerCase();
   for (const id of table.models.keys()) {
     if (id.toLowerCase().endsWith('/' + short)) return id;
+  }
+  // freebuff 那边也没有，最后看看是不是某个自定义上游的裸模型名（只在唯一命中时才认）
+  if (!value.includes('/')) {
+    const hits = customCatalog().filter((m) => m.bare === value);
+    if (hits.length === 1) return hits[0].id;
   }
   return isAnthropic ? DEFAULT_MODEL : value;
 }
@@ -516,6 +651,13 @@ export function filterModelList(keyRecord, list) {
       // 地区挡掉的模型对这个部署来说就是调不通，别塞给客户端
       if (hideDead && OPENCODE_REGION_LOCKED.has(stripPrefix(id))) return false;
       return hasOpencodeModel(id);
+    }
+    const custom = customEntry(id);
+    if (custom) {
+      const up = getUpstream(custom.upstreamId);
+      if (!up || up.enabled === false) return false;
+      if (hideDead && availabilityOf(id).state === 'unavailable') return false;
+      return true;
     }
     // 实测过、确认上游按模型本身拒绝的，默认不再对外提供 ——
     // 客户端拿到一份"里面有一半调不通"的模型列表毫无用处

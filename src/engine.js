@@ -19,10 +19,15 @@ import {
   defaultModel,
   providerForModel,
   opencodeModelList,
+  upstreamForModel,
+  stripUpstreamPrefix,
+  customModelList,
   DEFAULT_MODEL,
 } from './models.js';
 import { callOpencode, classifyOpencodeFailure, ANON_KEY } from './opencode.js';
 import { isOpencodeModel, stripPrefix, withPrefix, nativeProtocol } from './models-opencode.js';
+import { adapterFor, callUpstreamApi, classifyUpstreamFailure } from './protocols/index.js';
+import { rotationRule, nextCursor, setRotationRule } from './upstreams.js';
 import {
   anthropicToChat,
   chatToAnthropic,
@@ -98,25 +103,64 @@ export function eligibleAccounts(modelId) {
 }
 
 /**
- * 决定这次请求按什么顺序用号。
- * 自动模式：从当前钉住的号开始，失败再往后顺延（顺延也只在失败时发生）。
- * 手动模式：只有钉住的那一个，失败就直接报错。
+ * 决定这次请求按什么顺序用号。**每个上游一套策略，互不干扰**
+ * （设置在 settings.rotationRules[providerId]，见 src/upstreams.js）。
+ *
+ *   exhaust     钉住当前号，只有失败才顺延 —— 最省 session 额度，内置上游的默认值
+ *   onerror     和 exhaust 用同一个顺序，区别在 engine 那边：连"换号也没用"的
+ *               错误也照样换（worthNextAccount 会放宽）
+ *   roundrobin  每个请求从下一个号开始（指针在内存里）
+ *   random      每个请求随机挑一个起点
+ *   single      只用指定的那一个号，失败也不换
+ *
+ * 返回的 order 是"这次可以依次尝试的号"，第一个是起点。single 模式下只有一个。
  */
 export function selectOrder(modelId) {
   const eligible = eligibleAccounts(modelId);
-  const manual = store.settings.autoSwitch === false;
-  const activeId = store.settings.activeAccountId;
+  const provider = modelId ? providerForModel(modelId) : 'freebuff';
+  const rule = rotationRule(provider);
+  const mode = rule.mode;
+  const manual = mode === 'single';
+
   if (manual) {
-    const pinned = eligible.find((a) => a.id === activeId);
-    return { order: pinned ? [pinned] : [], manual, eligible };
+    // 没显式指定就退到全局的"当前账号"，都没有时用第一个可用的 ——
+    // 否则刚建好一个单号上游会直接 503，用户还得先去点一下"设为当前"
+    const pinned = eligible.find((a) => a.id === rule.activeAccountId) || eligible[0] || null;
+    return { order: pinned ? [pinned] : [], manual, mode, provider, eligible };
   }
+
+  if (!eligible.length) return { order: [], manual, mode, provider, eligible };
+
+  const rotate = (idx) => [...eligible.slice(idx), ...eligible.slice(0, idx)];
+
+  if (mode === 'roundrobin') {
+    return { order: rotate(nextCursor(provider, eligible.length)), manual, mode, provider, eligible };
+  }
+  if (mode === 'random') {
+    return { order: rotate(Math.floor(Math.random() * eligible.length)), manual, mode, provider, eligible };
+  }
+
+  // exhaust / onerror：从钉住的号开始
   const tier = modelId ? tierOf(modelId) : 'free';
+  const activeId = rule.activeAccountId;
   const idx = eligible.findIndex((a) => a.id === activeId);
   // 钉住的号只在"和最优先那一档同级"时才当起点：否则一次付费请求把指针挪到
   // 付费专用号上之后，后面的免费流量会一直去啃那个号
   const sticky = idx >= 0 && rank(eligible[idx], tier) === rank(eligible[0], tier);
-  const order = sticky ? [...eligible.slice(idx), ...eligible.slice(0, idx)] : eligible;
-  return { order, manual, eligible };
+  return { order: sticky ? rotate(idx) : eligible, manual, mode, provider, eligible };
+}
+
+/**
+ * 记住这个上游"现在用哪个号"。每个上游各记一份（rotationRules[provider]），
+ * 同时也更新全局的 activeAccountId 让老的控制台字段继续有意义。
+ */
+function setActiveForProvider(provider, accountId) {
+  try {
+    setRotationRule(provider, { activeAccountId: accountId });
+  } catch {
+    /* 策略写入失败不能影响这次响应 */
+  }
+  store.setActiveAccount(accountId);
 }
 
 function buildEnv(tokens, presentedKey) {
@@ -196,13 +240,23 @@ const FAILURE_TEXT = {
   token_invalid: 'token 失效',
   country_blocked: '地区受限',
   rate_limited: '额度用完',
+  no_credit: '余额不足',
   blocked: '上游拒绝',
   upstream_error: '上游失败',
 };
 
-/** 只有这些状态码值得换个号再试 */
-function worthNextAccount(status) {
-  return status === 429 || status === 401 || status === 403 || (status >= 500 && status <= 599);
+/**
+ * 这次失败值不值得换个号再试。
+ *
+ * 默认（exhaust / roundrobin / random）只在"换号可能有用"时换：额度、凭据、
+ * 上游 5xx。400/404 这类是请求本身写错了，换一百个号也一样。
+ * onerror 模式是用户明确要求"一出错就换"，所以放宽到所有失败 —— 但仍然排除
+ * CLIENT_ERRORS，那些换号纯属白烧额度。
+ */
+function worthNextAccount(status, mode) {
+  if (CLIENT_ERRORS.has(status)) return false;
+  if (mode === 'onerror') return true;
+  return status === 429 || status === 401 || status === 403 || status === 402 || (status >= 500 && status <= 599);
 }
 
 // ───────────────────────────── Anthropic 协议补齐 ─────────────────────────────
@@ -520,7 +574,7 @@ async function dispatchApi(req, res, url) {
     });
 
   /**
-   * 一次上游调用。两条路返回的都是 WHATWG Response，所以下游的
+   * 一次上游调用。三条路返回的都是 WHATWG Response，所以下游的
    * 状态判定 / 头部白名单 / 流式处理完全共用。
    *
    * opencode 那条路还要补协议差：Zen 是**按模型**钉协议的（chat 原生的模型
@@ -528,15 +582,30 @@ async function dispatchApi(req, res, url) {
    * 客户端协议和模型原生协议对不上时，就在这一层翻一次 body、回来再翻一次响应。
    *   bridge = 'a2c'：Anthropic 客户端 → chat 原生模型（免费模型全在这一档）
    *   bridge = 'c2a'：OpenAI 客户端   → Anthropic 原生模型（claude-* / qwen*）
+   *
+   * 自定义上游则统一以 chat 为中枢：客户端说 Anthropic 就先翻成 chat（a2c），
+   * 再由 src/protocols 的适配器翻成那个上游要的格式。所以四种协议两两组合
+   * 都不用单独写代码。
    */
+  const customUp = requestedModel ? upstreamForModel(requestedModel) : null;
   let bridge = null;
   if (requestedModel && isOpencodeModel(requestedModel)) {
     const native = nativeProtocol(requestedModel);
     if (isAnthropic && native !== 'anthropic') bridge = 'a2c';
     else if (!isAnthropic && native === 'anthropic') bridge = 'c2a';
+  } else if (customUp && isAnthropic) {
+    // 客户端发的是 Anthropic，内部一律先归一到 chat
+    bridge = 'a2c';
   }
   const callUpstream = (acct) => {
-    if (providerOf(acct) === 'opencode') {
+    const prov = providerOf(acct);
+    if (customUp && prov === customUp.id) {
+      const bare = stripUpstreamPrefix(requestedModel, customUp);
+      // 归一到中枢格式，再交给适配器翻成上游协议
+      const chatBody = isAnthropic ? anthropicToChat(parsed || {}, bare) : { ...(parsed || {}), model: bare };
+      return callUpstreamApi(customUp, { chatBody, model: bare, apiKey: acct.token });
+    }
+    if (prov === 'opencode') {
       // 发给 Zen 的模型名不能带我们自己的 opencode/ 前缀
       const bare = stripPrefix(requestedModel || parsed?.model || '');
       const body =
@@ -566,8 +635,8 @@ async function dispatchApi(req, res, url) {
       payload = JSON.parse(text);
     } catch {}
     if (isModelList && Array.isArray(payload?.data)) {
-      // 两个上游的模型合成一张表对外给出去
-      payload.data = filterModelList(keyRecord, [...payload.data, ...opencodeModelList()]);
+      // 所有上游的模型合成一张表对外给出去
+      payload.data = filterModelList(keyRecord, [...payload.data, ...opencodeModelList(), ...customModelList()]);
     }
     store.touchKey(keyRecord.id);
     if (payload) {
@@ -579,7 +648,7 @@ async function dispatchApi(req, res, url) {
     return;
   }
 
-  const { order, manual, eligible } = selectOrder(requestedModel);
+  const { order, manual, mode, eligible } = selectOrder(requestedModel);
   // opencode 的免费模型有一条不需要账号的路：官方 CLI 在没配 key 时用的 `public`
   // 匿名凭据。一个 opencode 号都没有时用它兜底，用户就能先把免费模型跑起来，
   // 不用非得先去注册。上游按出口 IP 限流，所以有真号的时候一定优先用真号。
@@ -634,8 +703,13 @@ async function dispatchApi(req, res, url) {
       break;
     }
     const text = await resp.text().catch(() => '');
+    const prov = providerOf(acct);
     const state =
-      providerOf(acct) === 'opencode' ? classifyOpencodeFailure(resp.status, text) : classifyFailure(resp.status, text);
+      prov === 'opencode'
+        ? classifyOpencodeFailure(resp.status, text)
+        : prov === 'freebuff'
+          ? classifyFailure(resp.status, text)
+          : classifyUpstreamFailure(resp.status, text);
     recordModelResult(requestedModel, { ok: false, status: resp.status, text });
     // 匿名那条路不是真账号，别往库里写状态
     if (!acct.anonymous) {
@@ -649,7 +723,7 @@ async function dispatchApi(req, res, url) {
     }
     last = { status: resp.status, text, acct, state };
     tried.push(`${acct.id}:${state}`);
-    if (manual || !worthNextAccount(resp.status)) break;
+    if (manual || !worthNextAccount(resp.status, mode)) break;
   }
 
   if (!hit) {
@@ -680,7 +754,8 @@ async function dispatchApi(req, res, url) {
 
   const { acct: used, response } = hit;
   if (!used.anonymous) {
-    store.setActiveAccount(used.id);
+    // 单号模式不该被请求悄悄改掉"当前账号"：那是用户手动钉的
+    if (mode !== 'single') setActiveForProvider(providerOf(used), used.id);
     if (used.status && used.status.state !== 'ok' && response.status < 400) {
       store.setAccountStatus(used.id, { state: 'ok', verdict: '存活', detail: '刚刚成功承接了一次请求', quota: used.status.quota || '', source: 'request' });
     }
@@ -692,7 +767,7 @@ async function dispatchApi(req, res, url) {
   for (const [k, v] of response.headers.entries()) {
     if (PASS_HEADERS.has(k.toLowerCase())) headers[k] = v;
   }
-  headers['x-myapi-rotation'] = manual ? 'manual' : used.anonymous ? 'anonymous' : 'sticky';
+  headers['x-myapi-rotation'] = used.anonymous ? 'anonymous' : mode;
   headers['x-myapi-provider'] = providerOf(used);
   if (tried.length) headers['x-myapi-accounts-tried'] = String(tried.length);
   if (requestedModel) headers['x-myapi-model-tier'] = tierOf(requestedModel);
@@ -709,8 +784,13 @@ async function dispatchApi(req, res, url) {
     try {
       payload = JSON.parse(text);
     } catch {}
-    const usageInfo = payload ? usageFromJson(payload) : null;
     const ok = response.status < 400;
+    // 自定义上游先归一到中枢格式：后面的 usage 统计、聊天记录、协议回翻
+    // 全都按 chat 的字段读，翻早一点这些就都不用再分情况
+    if (payload && ok && customUp && providerOf(used) === customUp.id) {
+      payload = adapterFor(customUp.format).responseToChat(payload, requestedModel);
+    }
+    const usageInfo = payload ? usageFromJson(payload) : null;
     recordModelResult(requestedModel, { ok, status: response.status, text: ok ? '' : text });
     track({
       acct: used,
@@ -745,7 +825,12 @@ async function dispatchApi(req, res, url) {
     return;
   }
 
-  // 流式：走过桥的要整段翻协议；其余情况沿用原来的补丁器（只改 message_start，不动事件边界）
+  // 流式要经过两级：
+  //   inbound  自定义上游的原生流 → 中枢 chat 流（chat 格式的上游返回 null，不用转）
+  //   patcher  中枢流 → 客户端要的协议
+  // 串起来正好覆盖"任意上游协议 × 任意客户端协议"，不用为每种组合单独写。
+  const inbound =
+    customUp && providerOf(used) === customUp.id ? adapterFor(customUp.format).createStreamToChat(requestedModel) : null;
   const patcher =
     bridge === 'a2c'
       ? createChatToAnthropicStream(requestedModel)
@@ -774,10 +859,13 @@ async function dispatchApi(req, res, url) {
       if (aborted || res.writableEnded || res.destroyed) break;
       if (!value) continue;
       if (!ttfbMs) ttfbMs = Date.now() - startedAt;
-      const text = decoder.decode(value, { stream: true });
+      const raw = decoder.decode(value, { stream: true });
+      // 先归一到中枢格式，usage 嗅探和补丁器读到的就都是 chat 的字段
+      const text = inbound ? inbound.push(raw) : raw;
+      if (inbound && !text) continue;
       sniffer.push(text);
-      const chunk = patcher ? patcher.push(text) : Buffer.from(value);
-      if (!chunk || (patcher && !chunk.length)) continue;
+      const chunk = patcher ? patcher.push(text) : inbound ? text : Buffer.from(value);
+      if (!chunk || ((patcher || inbound) && !chunk.length)) continue;
       bytesOut += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
       // 尊重背压：写不动的时候等 drain，否则慢客户端会把内存撑起来
       if (!res.write(chunk)) {
@@ -788,9 +876,18 @@ async function dispatchApi(req, res, url) {
         });
       }
     }
-    if (patcher && !aborted && !res.writableEnded) {
-      const rest = patcher.flush();
-      if (rest) res.write(rest);
+    if (!aborted && !res.writableEnded) {
+      // 收尾也要按同样的顺序过一遍：inbound 的尾巴要能再喂给 patcher
+      const tail = inbound ? inbound.flush() : '';
+      if (tail) {
+        sniffer.push(tail);
+        const out = patcher ? patcher.push(tail) : tail;
+        if (out) res.write(out);
+      }
+      if (patcher) {
+        const rest = patcher.flush();
+        if (rest) res.write(rest);
+      }
     }
   } catch {
     // 客户端断流是常态，不当错误处理

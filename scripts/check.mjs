@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 let failed = 0;
 
-for (const dir of ['src', 'vendor']) {
+for (const dir of ['src', 'src/protocols', 'vendor']) {
   const files = (await readdir(resolve(root, dir))).filter((f) => f.endsWith('.js'));
   for (const f of files) {
     const p = resolve(root, dir, f);
