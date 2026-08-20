@@ -5,17 +5,20 @@
 - 🔐 **输入管理员密码解锁**，进主页就能管号池，不用改环境变量、不用重新部署
 - 🌐 **在网页里直接登录加号**：走官方 CLI 那条授权码链路，点一下按钮就跳登录页，服务器轮询到 token 自动入池。**不需要 Telegram 机器人，不需要本地跑脚本**
 - 🖥️ **还带一个服务器内置浏览器**：容器里跑 patchright Chromium（headful + Xvfb，指纹接近真机），画面用 CDP 截屏推到网页上，你可以在网页里点、打字，直接在服务器上完成登录
+- 🧩 **两个上游合成一个号池**：除了 freebuff，还接了 **[opencode Zen](https://opencode.ai/zen)**（`https://opencode.ai/zen/v1`）。Zen 的号就是一个 API key，粘进来就能用，**默认只跑它的免费模型**；一个 Zen 号都没有时还能用官方 CLI 的 `public` 匿名凭证直接调免费模型
 - 👥 **多账号号池**：每个号可以设"全部模型 / 仅免费 / 付费优先"，付费模型只会落到允许的号上
 - 💳 **模型分免费和付费**：每个 API key 一个「允许付费模型」勾选框，不勾就只给免费模型，Premium 那几次/天的额度不会被误烧
 - 🔑 **多 API key**：分客户端发 key、单独停用、看调用次数
-- 📊 **用量统计**：请求数、token 数、耗时分位、首字延迟、按模型/按 Key/按账号拆分，48 小时柱状 + 30 天曲线，页面靠 SSE 自己刷新，不用手动点
+- 📊 **用量统计**：请求数、token 数、耗时分位、首字延迟、按模型/按 Key/按账号/按上游拆分，48 小时柱状 + 30 天曲线，页面靠 SSE 自己刷新，不用手动点
 - 💾 **聊天记录留存**（默认关）：打开后每次请求的消息和回复按 JSONL 落盘，可下载，自用复盘或者拿去训练
 - 🧹 **分级清理**：日常（只删记录和缓存）/ 清除不必要数据（再加用量统计）/ 全部清理（连账号和 Key），清之前先给你看每一类占了多少
 - 📋 **一键复制**：Base URL、API key、完整配置，复制完直接粘到 Cherry Studio / ChatGPT-Next-Web / one-api 里
 
 对外接口和原项目一致：`/v1/chat/completions`、`/v1/models`、`/v1/responses`、`/v1/messages`（Anthropic 协议）、`/healthz`。
+两个上游的模型合并成一张表对外给出去，opencode 那边的 id 统一带 `opencode/` 前缀（例如 `opencode/mimo-v2.5-free`），不会和 freebuff 的 `厂商/模型` 撞车。
 
 > 引擎文件 `vendor/worker.js` 原样引用上游（当前 **1.8.10**）、**一行没改**，方便随时 `npm run update-worker` 升级。所有新增能力都在 `src/` 这一层，控制台「模型」卡里会显示当前引擎版本。
+> opencode Zen 那条路**不经过** `vendor/worker.js`，是 `src/opencode.js` 直接发 HTTPS。
 
 ## 控制台长什么样
 
@@ -82,15 +85,18 @@ freebuff 的免费模型对出口 IP 有美国限制，部在欧洲或亚洲区�
 
 ### 第 1 步：加账号
 
-主页点 **「+ 添加账号」**，三种方式挑一种：
+主页点 **「+ 添加账号」**，四种方式挑一种（前三种是 freebuff，第四种是 opencode Zen）：
 
 | 方式 | 怎么用 | 什么时候用 |
 |---|---|---|
 | **① 授权链接**（推荐） | 点「生成授权链接」→ 自动开新标签 → 用 Google / GitHub 登录 → 回到控制台，状态自动变成"登录成功" | 默认就用这个，最稳。登录动作发生在**你自己的浏览器**里，不会被判定成自动化 |
-| **② 服务器内置浏览器** | 点「启动浏览器并打开登录页」→ 网页里出现服务器浏览器的画面 → 在画面里点按钮、用下面的输入框打字完成登录 | 你本地网络打不开 codebuff、或者想让登录动作从服务器出口发生 |
+| **② 服务器内置浏览器** | 点「启动浏览器并打开登录页」→ 网页里出现服务器浏览器的画面 → 在画面里点按钮、用下面的输入框打字完成登录 | 你本地网络打不开上游、或者想让登录动作从服务器出口发生 |
 | **③ 手动粘贴 token** | 把已有的 `authToken` 贴进去，支持一次贴多行 | 从别的部署 / `extract_freebuff.py` 迁移过来 |
+| **④ opencode Zen** | 两条路：自己去 <https://opencode.ai/zen> 登录后复制 API key 粘进来；或者点「用内置浏览器登录」，在服务器浏览器的画面里登录，再把 key 复制到旁边的框 | 想用 Zen 那批免费模型（`mimo-v2.5-free`、`big-pickle`、`nemotron-*-free` 等） |
 
-加完可以点「检测」做一次 **0 消耗探活**（只读 `GET /api/v1/freebuff/session`，不创建 session、不扣额度），能看出存活 / token 失效 / 被封 / 地区受限 / 额度用完。
+加完可以点「检测」：freebuff 的号做 **0 消耗探活**（只读 `GET /api/v1/freebuff/session`，不创建 session、不扣额度）；opencode 的号用一个免费模型发 1 token 的最小请求探活（上游没有查余额的接口，这是唯一能确认 key 有效的办法）。两边都能看出存活 / key 失效 / 被封 / 地区受限 / 额度用完。
+
+**opencode 的号为什么没有"登录"按钮**：Zen 没有 CLI 授权码那一套。`/auth/*` 是浏览器回调端点（GET 会回 `500 No authorization code found.`），也没有 `oauth-authorization-server` 发现文档，官方文档写的流程就是"网页登录 → 复制 API key → 粘进客户端"。所以这里只能把登录页开给你，key 还是得你复制一下。
 
 ### 第 2 步：拿 Base URL 和 key
 
@@ -166,6 +172,25 @@ API Key    sk-fb-xxxxxxxx
 - `仅免费`：只承接免费模型，Premium 额度留着
 - `付费优先`：付费模型优先落到它头上
 
+### opencode Zen 那半张表
+
+Zen 的免费/付费是**明码标价**的（就是"要不要花你自己的钱"），跟 freebuff 那套额度池完全是两回事：
+
+| 分类 | 模型 | 说明 |
+|---|---|---|
+| **免费**（8 个） | `big-pickle`、`mimo-v2.5-free`、`hy3-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、`deepseek-v4-flash-free`、`laguna-s-2.1-free`、`muse-spark-1.2-contributor-free` | 不花钱。**没有 key 也能调**（走官方 CLI 的 `public` 匿名凭证，上游按出口 IP 限流） |
+| **按量计费** | `claude-*`、`qwen*`、`glm-*`、`minimax-*`、`kimi-*`、`deepseek-v4-pro/flash` 等 | 真的扣你 Zen 账户余额，必须在 key 上勾「允许付费模型」 |
+
+几个实测出来的坑，都已经在代码里处理掉了：
+
+- **`big-pickle` 是免费的，但名字里没有 `free`。** 参考实现只按名字判断，会把它当付费。这里用显式名单 + 名字兜底两层判断。
+- **`muse-spark-1.2-contributor-free` 会回 `403 RegionError`**（上游按地区限制）。控制台里标成"当前地区不可用"，默认不列给客户端。
+- **必须带 `x-opencode-*` 那组请求头**。只带 `Authorization` 的话免费模型会被当成普通匿名流量，直接 `429 FreeUsageLimitError`；补上 `User-Agent: opencode/…`、`x-opencode-client: cli` 和 `ses_`/`req_`/`prj_` 三个 id 之后同一个请求就是 200。会话 id 按第一条 user 消息哈希，多轮对话里保持稳定。
+- **Zen 是按模型钉协议的，不是按端点。** chat 原生的模型（免费的全是）POST 到 `/v1/messages` 或 `/v1/responses` 一律回 `400 Input required`。所以本项目按模型的原生协议选端点，客户端协议对不上时在网关这层翻一次 body、回来再翻一次响应（`src/anthropic-bridge.js`，两个方向都覆盖文本 / system / 多轮 / tools / stop 原因 / usage / 流式）。**结果就是 Anthropic 客户端（Claude Code 这类）也能直接用 Zen 的免费模型。**
+- **`gpt-*` / `grok-*` / `muse-*` / `gemini-*` 暂时不承接**：它们的原生协议是 OpenAI Responses 和 Google `generateContent`，这两套 body 格式还没实现。控制台里标成"协议未实现"并写清原因，也不会列进 `/v1/models`（列出去只会让客户端拿到一个必然 400 的 id）。63 个模型里目前对外提供 32 个。
+- **401 不一定是 key 错了**：Zen 把余额耗尽、月度上限、模型被工作区管理员停用也都回 401。控制台按上游的 `error.type`（`AuthError` / `CreditsError` / `RegionError` / `FreeUsageLimitError` …）分类，不靠在正文里捞字符串。
+- **`GET /zen/v1/models` 免鉴权**，所以一个 Zen 号都没有也能拉到完整模型表；拉不到就退回随包的免费名单，不会让控制台里一个 opencode 模型都不剩。
+
 ## 三点五、账号怎么切（不轮询）
 
 默认策略是**钉住一个号用到失败为止**，不是轮询：
@@ -184,6 +209,8 @@ API Key    sk-fb-xxxxxxxx
 | **当前使用的账号** | 手动指定从哪个号开始用；留空＝下一次请求自己挑第一个可用的 |
 
 「账号池」里每行都有「设为当前」按钮，概览的通道条上当前那个号会标 `当前`。
+
+**两个上游各排各的队**：选号第一步先按"这个模型属于哪个上游"筛，`opencode/` 的模型只会落到 opencode 的号上，反之也一样。而且这一步在"全被标记失效时仍然放行"那条兜底逻辑**之前** —— 不然一边的号全挂了，兜底会把另一边的号捞过来，拿着错的凭据去撞上游。opencode 的免费模型还多一条：号池里一个 opencode 号都没有时，会退到 `public` 匿名凭证（`OPENCODE_ANONYMOUS=false` 可关），响应头 `x-myapi-rotation: anonymous` 会标出来。每个响应都带 `x-myapi-provider`，能看出这一次走的是哪个上游。
 
 ---
 
@@ -238,6 +265,9 @@ API Key    sk-fb-xxxxxxxx
 | `PORT` | Railway 自动注入 | 监听端口 |
 | `FREEBUFF_API_KEY` | 首次启动自动生成 | 预置第一个 API key |
 | `FREEBUFF_TOKEN` | 空 | 预置账号 token，逗号或换行分隔（一般不用，控制台加号更方便） |
+| `OPENCODE_API_KEY` | 空 | 预置 opencode Zen 的 API key，逗号或换行分隔。加进来的号默认只服务免费模型 |
+| `OPENCODE_ANONYMOUS` | `true` | 号池里没有 opencode 号时，是否用官方 CLI 的 `public` 匿名凭证调 Zen 的免费模型。上游按出口 IP 限流，共享 IP 上容易 429 |
+| `OPENCODE_API` | `https://opencode.ai/zen/v1` | Zen 的接口地址，一般不用改 |
 | `ALLOW_PAID_DEFAULT` | `false` | 新建 API key 时「允许付费模型」的默认值 |
 | `ENABLE_BROWSER_LOGIN` | `true` | `false` = 关掉内置浏览器（也不再用 Xvfb 启动） |
 | `BROWSER_HEADLESS` | `auto` | `auto` = 有 Xvfb 就 headful（指纹更好），没有就 headless |
@@ -283,6 +313,27 @@ curl https://你的域名/v1/chat/completions \
   -d '{"model":"mimo/mimo-v2.5","messages":[{"role":"user","content":"你好"}]}'
 ```
 
+用 opencode Zen 的免费模型（一个 Zen 号都没有也能跑，会走匿名凭证）：
+
+```bash
+curl https://你的域名/v1/chat/completions \
+  -H "Authorization: Bearer sk-fb-你的key" \
+  -H 'content-type: application/json' \
+  -d '{"model":"opencode/mimo-v2.5-free","messages":[{"role":"user","content":"你好"}]}'
+```
+
+Anthropic 协议同样能用 Zen 的免费模型（网关会自动翻协议）：
+
+```bash
+curl https://你的域名/v1/messages \
+  -H "x-api-key: sk-fb-你的key" \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'content-type: application/json' \
+  -d '{"model":"opencode/mimo-v2.5-free","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
+```
+
+响应头里有三个自定义字段方便排查：`x-myapi-provider`（这次走了哪个上游）、`x-myapi-rotation`（`sticky` / `manual` / `anonymous`）、`x-myapi-model-tier`（免费还是付费）。
+
 ---
 
 ## 六、本地跑 / 自建 Docker
@@ -306,7 +357,7 @@ docker run -d --name myapi -p 8787:8787 \
 ```bash
 npm run update-worker   # 拉上游最新 worker.js + 模型表（多镜像 + 重试 + 内容校验）
 npm run check           # 语法/导入自检
-npm test                # 48 项单测 + 56 项集成测试（会自己起一个临时服务）
+npm test                # 102 项单测 + 72 项集成测试（会自己起一个临时服务）
 ```
 
 ---

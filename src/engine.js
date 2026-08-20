@@ -7,7 +7,7 @@
 //   这一层决定要不要换号重试。手动模式下连重试都不做。
 import worker from '../vendor/worker.js';
 import { config } from './config.js';
-import { store } from './store.js';
+import { store, providerOf } from './store.js';
 import {
   checkModelAccess,
   filterModelList,
@@ -17,8 +17,21 @@ import {
   looksLikeClaude,
   recordModelResult,
   defaultModel,
+  providerForModel,
+  opencodeModelList,
   DEFAULT_MODEL,
 } from './models.js';
+import { callOpencode, classifyOpencodeFailure, ANON_KEY } from './opencode.js';
+import { isOpencodeModel, stripPrefix, withPrefix, nativeProtocol } from './models-opencode.js';
+import {
+  anthropicToChat,
+  chatToAnthropic,
+  createChatToAnthropicStream,
+  chatToAnthropicRequest,
+  anthropicToChatResponse,
+  createAnthropicToChatStream,
+  countTokensReply,
+} from './anthropic-bridge.js';
 import { usage, usageFromJson, createUsageSniffer } from './usage.js';
 import { appendChat } from './chatlog.js';
 import { readBody, randomId, createRateLimiter, createGate, clientIp } from './util.js';
@@ -71,7 +84,12 @@ function rank(account, tier) {
 /** 能用于该模型的账号（已排好优先级，不含"当前钉住哪个"的逻辑） */
 export function eligibleAccounts(modelId) {
   const tier = modelId ? tierOf(modelId) : 'free';
-  const enabled = store.accounts.filter((a) => a.enabled && a.token && a.token.length > 8);
+  // 上游必须对得上：opencode 的 key 塞进 freebuff 的 worker 里毫无意义，
+  // 反过来也一样。这一步要在"全失效就放行"之前做，否则 fail-open 会把
+  // 另一个上游的号捞回来，拿着错的凭据去撞。
+  const want = modelId ? providerForModel(modelId) : 'freebuff';
+  const mine = store.accounts.filter((a) => providerOf(a) === want);
+  const enabled = mine.filter((a) => a.enabled && a.token && a.token.length > 8);
   const dead = new Set(['token_invalid', 'banned']);
   const healthy = enabled.filter((a) => !dead.has(a.status?.state));
   const base = healthy.length ? healthy : enabled; // 全被标记失效时仍然放行，让上游自己说话
@@ -422,7 +440,11 @@ async function dispatchApi(req, res, url) {
   // 没写 model 的请求：按当前"不限量"那一档挑一个（见 models.defaultModel），
   // 并且照样过门禁 —— 否则"不带 model"就成了绕开 key 白名单和已下架模型的口子。
   // 解析出来的 id 会写回请求体，所以引擎拿到的是这里定下来的模型，不是它自己的默认值。
-  if (needsModelAuth && !requestedModel) requestedModel = defaultModel();
+  // 池子里一个 freebuff 号都没有时挑 opencode 的免费模型，不然必然 503。
+  if (needsModelAuth && !requestedModel) {
+    const hasFreebuff = store.accounts.some((a) => a.enabled && providerOf(a) === 'freebuff');
+    requestedModel = defaultModel({ hasFreebuff });
+  }
 
   const protocol = isAnthropic ? 'anthropic' : pathname.endsWith('/responses') ? 'responses' : 'openai';
   const startedAt = Date.now();
@@ -434,6 +456,7 @@ async function dispatchApi(req, res, url) {
         keyId: keyRecord.id,
         keyName: keyRecord.name,
         accountId: acct?.id || '',
+        provider: requestedModel ? providerForModel(requestedModel) : '',
         model: requestedModel || '',
         tier: requestedModel ? tierOf(requestedModel) : '',
         protocol,
@@ -449,6 +472,7 @@ async function dispatchApi(req, res, url) {
       });
       appendChat({
         model: requestedModel,
+        provider: requestedModel ? providerForModel(requestedModel) : '',
         tier: requestedModel ? tierOf(requestedModel) : '',
         protocol,
         stream: Boolean(parsed?.stream),
@@ -495,8 +519,46 @@ async function dispatchApi(req, res, url) {
       body: raw.length ? raw : null,
     });
 
+  /**
+   * 一次上游调用。两条路返回的都是 WHATWG Response，所以下游的
+   * 状态判定 / 头部白名单 / 流式处理完全共用。
+   *
+   * opencode 那条路还要补协议差：Zen 是**按模型**钉协议的（chat 原生的模型
+   * 只认 chat 格式，claude-* 只认 Anthropic 格式），跟客户端用了哪个端点无关。
+   * 客户端协议和模型原生协议对不上时，就在这一层翻一次 body、回来再翻一次响应。
+   *   bridge = 'a2c'：Anthropic 客户端 → chat 原生模型（免费模型全在这一档）
+   *   bridge = 'c2a'：OpenAI 客户端   → Anthropic 原生模型（claude-* / qwen*）
+   */
+  let bridge = null;
+  if (requestedModel && isOpencodeModel(requestedModel)) {
+    const native = nativeProtocol(requestedModel);
+    if (isAnthropic && native !== 'anthropic') bridge = 'a2c';
+    else if (!isAnthropic && native === 'anthropic') bridge = 'c2a';
+  }
+  const callUpstream = (acct) => {
+    if (providerOf(acct) === 'opencode') {
+      // 发给 Zen 的模型名不能带我们自己的 opencode/ 前缀
+      const bare = stripPrefix(requestedModel || parsed?.model || '');
+      const body =
+        bridge === 'a2c'
+          ? anthropicToChat(parsed || {}, bare)
+          : bridge === 'c2a'
+            ? chatToAnthropicRequest(parsed || {}, bare)
+            : { ...(parsed || {}), model: bare };
+      return callOpencode({ pathname, method: req.method, body, req, token: acct.token, modelId: bare });
+    }
+    return worker.fetch(makeRequest(), buildEnv([acct.token], presented));
+  };
+
   // 模型列表和 count_tokens 都不碰上游、不占额度，不需要账号
   if (isModelList || isCountTokens) {
+    // Zen 没有 count_tokens 接口，模型 id 也不在 worker 的表里（丢给它会被判无效模型），
+    // 所以 opencode 的模型自己在本地粗算一个数
+    if (isCountTokens && parsed?.model && isOpencodeModel(resolveModelId(String(parsed.model), true))) {
+      store.touchKey(keyRecord.id);
+      send(res, 200, countTokensReply(parsed), { 'request-id': `req_${randomId(12)}` });
+      return;
+    }
     const resp = await worker.fetch(makeRequest(), buildEnv([], presented));
     const text = await resp.text();
     let payload = null;
@@ -504,7 +566,8 @@ async function dispatchApi(req, res, url) {
       payload = JSON.parse(text);
     } catch {}
     if (isModelList && Array.isArray(payload?.data)) {
-      payload.data = filterModelList(keyRecord, payload.data);
+      // 两个上游的模型合成一张表对外给出去
+      payload.data = filterModelList(keyRecord, [...payload.data, ...opencodeModelList()]);
     }
     store.touchKey(keyRecord.id);
     if (payload) {
@@ -517,14 +580,32 @@ async function dispatchApi(req, res, url) {
   }
 
   const { order, manual, eligible } = selectOrder(requestedModel);
+  // opencode 的免费模型有一条不需要账号的路：官方 CLI 在没配 key 时用的 `public`
+  // 匿名凭据。一个 opencode 号都没有时用它兜底，用户就能先把免费模型跑起来，
+  // 不用非得先去注册。上游按出口 IP 限流，所以有真号的时候一定优先用真号。
+  const anonOpencode =
+    !order.length &&
+    config.opencodeAnonymous &&
+    requestedModel &&
+    isOpencodeModel(requestedModel) &&
+    tierOf(requestedModel) === 'free';
+  if (anonOpencode) {
+    order.push({ id: 'anon', token: ANON_KEY, provider: 'opencode', pool: 'free', anonymous: true });
+  }
   if (!order.length) {
     const tier = requestedModel ? tierOf(requestedModel) : 'free';
+    const wantOpencode = requestedModel && isOpencodeModel(requestedModel);
     let hint;
-    if (!store.accounts.length) hint = '账号池是空的，先去控制台添加账号';
+    if (wantOpencode && !store.accounts.some((a) => providerOf(a) === 'opencode')) {
+      hint = tier === 'paid'
+        ? '这是 opencode Zen 的付费模型，必须先在控制台添加一个 opencode 号（去 https://opencode.ai/zen 登录后复制 API key）'
+        : '号池里没有 opencode 账号，而匿名模式是关着的（OPENCODE_ANONYMOUS=false）：去控制台添加一个 opencode 号';
+    } else if (!store.accounts.length) hint = '账号池是空的，先去控制台添加账号';
     else if (manual)
       hint = eligible.length
         ? '手动模式下还没指定要用哪个账号（或者指定的账号不能用于这个模型），去控制台「账号池」点「设为当前」'
         : '手动模式下指定的账号已停用或不能承接这个模型，去控制台换一个';
+    else if (wantOpencode) hint = 'opencode 号都被停用或已标记失效了，去控制台看看账号状态';
     else if (tier === 'paid') hint = '没有能承接付费(Premium)模型的账号：检查账号的「用途」是不是被限制成了仅免费';
     else hint = '账号池里没有可用账号（可能都被停用或已标记失效）';
     track({ status: 503, ok: false, error: 'no_account' });
@@ -540,10 +621,10 @@ async function dispatchApi(req, res, url) {
   for (const acct of order) {
     let resp;
     try {
-      resp = await worker.fetch(makeRequest(), buildEnv([acct.token], presented));
+      resp = await callUpstream(acct);
     } catch (err) {
-      console.error(`[engine] worker 异常 ${pathname} (${acct.id}): ${err.message}`);
-      last = { status: 502, text: `worker 异常: ${err.message}`, acct, state: 'upstream_error' };
+      console.error(`[engine] 上游异常 ${pathname} (${acct.id}): ${err.message}`);
+      last = { status: 502, text: `上游异常: ${err.message}`, acct, state: 'upstream_error' };
       tried.push(`${acct.id}:exception`);
       if (manual) break;
       continue;
@@ -553,15 +634,19 @@ async function dispatchApi(req, res, url) {
       break;
     }
     const text = await resp.text().catch(() => '');
-    const state = classifyFailure(resp.status, text);
+    const state =
+      providerOf(acct) === 'opencode' ? classifyOpencodeFailure(resp.status, text) : classifyFailure(resp.status, text);
     recordModelResult(requestedModel, { ok: false, status: resp.status, text });
-    store.setAccountStatus(acct.id, {
-      state,
-      verdict: FAILURE_TEXT[state] || '上游失败',
-      detail: `HTTP ${resp.status}：${String(text).slice(0, 200)}`,
-      quota: acct.status?.quota || '',
-      source: 'request',
-    });
+    // 匿名那条路不是真账号，别往库里写状态
+    if (!acct.anonymous) {
+      store.setAccountStatus(acct.id, {
+        state,
+        verdict: FAILURE_TEXT[state] || '上游失败',
+        detail: `HTTP ${resp.status}：${String(text).slice(0, 200)}`,
+        quota: acct.status?.quota || '',
+        source: 'request',
+      });
+    }
     last = { status: resp.status, text, acct, state };
     tried.push(`${acct.id}:${state}`);
     if (manual || !worthNextAccount(resp.status)) break;
@@ -594,9 +679,11 @@ async function dispatchApi(req, res, url) {
   }
 
   const { acct: used, response } = hit;
-  store.setActiveAccount(used.id);
-  if (used.status && used.status.state !== 'ok' && response.status < 400) {
-    store.setAccountStatus(used.id, { state: 'ok', verdict: '存活', detail: '刚刚成功承接了一次请求', quota: used.status.quota || '', source: 'request' });
+  if (!used.anonymous) {
+    store.setActiveAccount(used.id);
+    if (used.status && used.status.state !== 'ok' && response.status < 400) {
+      store.setAccountStatus(used.id, { state: 'ok', verdict: '存活', detail: '刚刚成功承接了一次请求', quota: used.status.quota || '', source: 'request' });
+    }
   }
 
   // 白名单透传：上游头里可能有 set-cookie / access-control-* 之类，
@@ -605,7 +692,8 @@ async function dispatchApi(req, res, url) {
   for (const [k, v] of response.headers.entries()) {
     if (PASS_HEADERS.has(k.toLowerCase())) headers[k] = v;
   }
-  headers['x-myapi-rotation'] = manual ? 'manual' : 'sticky';
+  headers['x-myapi-rotation'] = manual ? 'manual' : used.anonymous ? 'anonymous' : 'sticky';
+  headers['x-myapi-provider'] = providerOf(used);
   if (tried.length) headers['x-myapi-accounts-tried'] = String(tried.length);
   if (requestedModel) headers['x-myapi-model-tier'] = tierOf(requestedModel);
   if (isAnthropic) headers['request-id'] = `req_${randomId(12)}`;
@@ -633,7 +721,13 @@ async function dispatchApi(req, res, url) {
       replyText: wantChat ? replyTextFrom(payload) : null,
       error: ok ? null : `HTTP ${response.status}`,
     });
-    if (payload && isAnthropic) {
+    // 走过桥的：上游给的是对面那套格式，这里翻回客户端要的。
+    // 错误响应不翻 —— 错误信封两边形状本来就差不多，翻反而容易丢信息。
+    if (payload && ok && bridge === 'a2c') {
+      send(res, response.status, chatToAnthropic(payload, requestedModel), headers);
+    } else if (payload && ok && bridge === 'c2a') {
+      send(res, response.status, anthropicToChatResponse(payload, requestedModel), headers);
+    } else if (payload && isAnthropic) {
       send(res, response.status, patchAnthropicMessage(payload), headers);
     } else if (payload) {
       send(res, response.status, payload, headers);
@@ -651,7 +745,15 @@ async function dispatchApi(req, res, url) {
     return;
   }
 
-  const patcher = isAnthropic ? createAnthropicStreamPatcher() : null;
+  // 流式：走过桥的要整段翻协议；其余情况沿用原来的补丁器（只改 message_start，不动事件边界）
+  const patcher =
+    bridge === 'a2c'
+      ? createChatToAnthropicStream(requestedModel)
+      : bridge === 'c2a'
+        ? createAnthropicToChatStream(requestedModel)
+        : isAnthropic
+          ? createAnthropicStreamPatcher()
+          : null;
   const sniffer = createUsageSniffer({ collectText: wantChat });
   const decoder = new TextDecoder();
   const reader = response.body.getReader();
@@ -727,7 +829,9 @@ function replyTextFrom(payload) {
 
 /** 取 worker 视角的账号健康快照（不额外调上游，只读 worker 内存里的观测结果） */
 export async function workerHealth() {
-  const tokens = store.accounts.filter((a) => a.enabled).map((a) => a.token);
+  // 只把 freebuff 的 token 交给 worker：opencode 的 key 塞进 FREEBUFF_TOKEN
+  // 既没意义，也等于把它送去一个用不着它的上游
+  const tokens = store.accounts.filter((a) => a.enabled && providerOf(a) === 'freebuff').map((a) => a.token);
   const resp = await callWorker('/healthz', { tokens });
   try {
     return await resp.json();

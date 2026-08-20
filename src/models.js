@@ -11,6 +11,22 @@ import { resolve } from 'node:path';
 import { ROOT } from './config.js';
 import { store } from './store.js';
 import { fetchOfficialTable } from './model-source.js';
+import {
+  buildOpencodeCatalog,
+  isOpencodeModel,
+  isFreeOpencodeModel,
+  opencodeNote,
+  opencodeDisplayName,
+  stripPrefix,
+  withPrefix,
+  OPENCODE_PREFIX,
+  OPENCODE_REGION_LOCKED,
+  defaultOpencodeModel,
+  isSupportedProtocol,
+  protocolNote,
+  nativeProtocol,
+} from './models-opencode.js';
+import { fetchOpencodeModels } from './opencode.js';
 
 const RELEASE_SOURCES = [
   'https://github.com/pingmike2/freebuff2api-wokers/releases/latest/download/freebuff-models.json',
@@ -33,6 +49,38 @@ const bundledPremium = new Set(bundled?.pools?.premium || []);
 let table = normalize(bundled, 'bundled');
 let lastRefresh = 0;
 let refreshing = null;
+
+// opencode Zen 的模型表：id（带 opencode/ 前缀）-> 条目。
+// 上游 /v1/models 免鉴权，所以就算一个 opencode 号都没配也能拉到；
+// 先用静态免费名单垫底，刷新成功再覆盖。
+let ocTable = new Map(buildOpencodeCatalog(null).map((m) => [m.id, m]));
+let ocLastRefresh = 0;
+
+/** opencode 那半张表（控制台和门禁都从这里读） */
+export function opencodeEntry(modelId) {
+  return ocTable.get(withPrefix(stripPrefix(modelId))) || null;
+}
+
+export function hasOpencodeModel(modelId) {
+  return ocTable.has(withPrefix(stripPrefix(modelId)));
+}
+
+/**
+ * opencode 那张表是不是真从上游拉下来的。
+ * 拉不到时表里只有静态的免费名单，这时候不能拿"表里没有"当"模型不存在" ——
+ * 否则一次网络抖动就会让所有 Zen 付费模型集体 404。
+ */
+export function opencodeTableIsLive() {
+  return ocLastRefresh > 0;
+}
+
+async function refreshOpencode() {
+  const ids = await fetchOpencodeModels();
+  if (!ids) return false;
+  ocTable = new Map(buildOpencodeCatalog(ids).map((m) => [m.id, m]));
+  ocLastRefresh = Date.now();
+  return true;
+}
 
 function normalize(raw, source) {
   const pools = raw?.pools || {};
@@ -87,6 +135,8 @@ export async function refreshCatalog(force = false) {
   if (!force && Date.now() - lastRefresh < REFRESH_MS) return table;
   if (refreshing) return refreshing;
   refreshing = (async () => {
+    // opencode 那半张表和 freebuff 互不影响，一起刷，谁失败都不拖累对方
+    refreshOpencode().catch(() => {});
     // 先试官方常量源码：它是第三方那份 JSON 的上游，没有"等人生成"的延迟
     try {
       const official = await fetchOfficialTable();
@@ -126,6 +176,8 @@ export async function refreshCatalog(force = false) {
 export function tierOf(modelId) {
   const override = store.settings?.modelTierOverrides?.[modelId];
   if (override === 'free' || override === 'paid') return override;
+  // opencode Zen：免费/付费是上游明码标价的，按它自己的名单判
+  if (isOpencodeModel(modelId)) return isFreeOpencodeModel(modelId) ? 'free' : 'paid';
   if (table.premium.has(modelId)) return 'paid';
   if (table.standard.has(modelId) || table.glm.has(modelId)) return 'free';
   // 未分类模型：保守当付费处理，免得没勾「允许付费」的 key 把 premium 额度烧掉。
@@ -133,7 +185,13 @@ export function tierOf(modelId) {
   return 'paid';
 }
 
+/** 这个模型该找哪个上游？'opencode' | 'freebuff' */
+export function providerForModel(modelId) {
+  return isOpencodeModel(modelId) ? 'opencode' : 'freebuff';
+}
+
 export function isKnownModel(modelId) {
+  if (isOpencodeModel(modelId)) return hasOpencodeModel(modelId);
   return table.models.has(modelId);
 }
 
@@ -153,6 +211,7 @@ export function isLimitedOffer(modelId) {
 }
 
 export function noteOf(modelId) {
+  if (isOpencodeModel(modelId)) return opencodeNote(modelId);
   const lim = table.limits || {};
   if (isDeepSeekFamily(modelId) && table.premium.has(modelId)) {
     return `DeepSeek 家族：Flash 和 Pro 共用每天 ${lim.deepseek || 1} 次 session，而且这一次还照样扣 Premium 额度 —— 全池里最紧的`;
@@ -245,6 +304,8 @@ export function noteEngineModelList(liveIds) {
   if (!Array.isArray(liveIds) || liveIds.length < 3) return enginePaused;
   const live = new Set(liveIds);
   enginePaused.clear();
+  // 只对 freebuff 的模型做这个判断：opencode 的模型根本不经过 vendor/worker.js，
+  // 拿引擎列表去比会把它们全判成"已暂停"
   for (const id of table.models.keys()) if (!live.has(id)) enginePaused.add(id);
   return enginePaused;
 }
@@ -254,6 +315,19 @@ export function isEnginePaused(modelId) {
 }
 
 export function availabilityOf(modelId) {
+  if (isOpencodeModel(modelId)) {
+    const entry = opencodeEntry(modelId);
+    if (!entry) return { state: 'unverified', detail: '不在 opencode Zen 当前的模型列表里', at: null };
+    if (entry.supported === false) {
+      return { state: 'protocol_unsupported', detail: protocolNote(modelId), at: null };
+    }
+    if (entry.regionLocked) {
+      return { state: 'region_locked', detail: '上游按地区限制：当前机房请求会回 403 RegionError', at: null };
+    }
+    const st = store.modelStatus?.[modelId];
+    if (st) return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
+    return { state: 'listed', detail: 'opencode Zen 上游列表里有它（还没实测过）', at: null };
+  }
   if (enginePaused.has(modelId)) {
     return {
       state: 'paused',
@@ -268,25 +342,44 @@ export function availabilityOf(modelId) {
 
 /** 控制台用的完整目录（可传入 worker /v1/models 返回的 id 列表做合并） */
 export function catalog(extraIds = []) {
-  const ids = new Set([...table.models.keys(), ...extraIds]);
+  const ids = new Set([...table.models.keys(), ...extraIds, ...ocTable.keys()]);
   const disabled = new Set(store.settings?.disabledModels || []);
   return [...ids]
-    .map((id) => ({
-      id,
-      tier: tierOf(id),
-      pool: table.premium.has(id) ? 'premium' : table.glm.has(id) ? 'glm' : table.standard.has(id) ? 'standard' : 'unknown',
-      note: noteOf(id),
-      agent: table.models.get(id)?.agent || '',
-      enabled: !disabled.has(id),
-      overridden: Boolean(store.settings?.modelTierOverrides?.[id]),
-      availability: availabilityOf(id),
-      limitedOffer: isLimitedOffer(id),
-      deepseekFamily: isDeepSeekFamily(id),
-      displayName: table.models.get(id)?.displayName || '',
-      upstreamAvailability: table.models.get(id)?.availability || '',
-      closedWindowUtc: table.models.get(id)?.closedWindowUtc || '',
-    }))
-    .sort((a, b) => (a.tier === b.tier ? a.id.localeCompare(b.id) : a.tier === 'free' ? -1 : 1));
+    .map((id) => {
+      const oc = isOpencodeModel(id) ? opencodeEntry(id) : null;
+      return {
+        id,
+        provider: oc ? 'opencode' : 'freebuff',
+        tier: tierOf(id),
+        pool: oc
+          ? oc.free
+            ? 'zen-free'
+            : 'zen-paid'
+          : table.premium.has(id)
+            ? 'premium'
+            : table.glm.has(id)
+              ? 'glm'
+              : table.standard.has(id)
+                ? 'standard'
+                : 'unknown',
+        note: noteOf(id),
+        agent: table.models.get(id)?.agent || '',
+        enabled: !disabled.has(id),
+        overridden: Boolean(store.settings?.modelTierOverrides?.[id]),
+        availability: availabilityOf(id),
+        limitedOffer: oc ? false : isLimitedOffer(id),
+        deepseekFamily: oc ? false : isDeepSeekFamily(id),
+        displayName: oc ? oc.displayName : table.models.get(id)?.displayName || '',
+        upstreamAvailability: oc ? '' : table.models.get(id)?.availability || '',
+        closedWindowUtc: oc ? '' : table.models.get(id)?.closedWindowUtc || '',
+      };
+    })
+    .sort((a, b) => {
+      // 先按上游分组，组内免费在前，再按 id
+      if (a.provider !== b.provider) return a.provider === 'freebuff' ? -1 : 1;
+      if (a.tier !== b.tier) return a.tier === 'free' ? -1 : 1;
+      return a.id.localeCompare(b.id);
+    });
 }
 
 export function catalogMeta() {
@@ -296,6 +389,7 @@ export function catalogMeta() {
     lastRefresh,
     count: table.models.size,
     limits: table.limits || null,
+    opencode: { count: ocTable.size, lastRefresh: ocLastRefresh },
   };
 }
 
@@ -303,10 +397,13 @@ export function catalogMeta() {
  * 客户端没写 model 时用哪个。默认挑当前 standard 池里的第一个（也就是"不限量"那一档），
  * 而不是死写 flash —— 上游 2026-08-18 把 flash 挪进 premium 池之后，
  * 死写 flash 会让每个不带 model 的请求都去啃每天 1 次的 DeepSeek 额度。
+ * hasFreebuff=false（池子里只有 opencode 号）时改挑 opencode 的免费模型，
+ * 否则不带 model 的请求会被送去 freebuff 然后因为没号直接 503。
  */
-export function defaultModel() {
+export function defaultModel({ hasFreebuff = true } = {}) {
   const configured = store.settings?.defaultModel;
-  if (configured && table.models.has(configured)) return configured;
+  if (configured && (table.models.has(configured) || hasOpencodeModel(configured))) return configured;
+  if (!hasFreebuff) return defaultOpencodeModel();
   const disabled = new Set(store.settings?.disabledModels || []);
   const free = [...table.standard]
     .filter(
@@ -323,6 +420,37 @@ export function defaultModel() {
 
 /** 某个 API key 能不能用这个模型 */
 export function checkModelAccess(keyRecord, modelId) {
+  const disabled = new Set(store.settings?.disabledModels || []);
+  // opencode 的模型不经过 vendor/worker.js，所以 PAUSED_MODELS 那一套跟它无关
+  if (isOpencodeModel(modelId)) {
+    // 只有拿到过上游真实列表时才敢说"这个模型不存在"
+    if (!hasOpencodeModel(modelId) && opencodeTableIsLive()) {
+      return {
+        ok: false,
+        status: 404,
+        message: `模型 ${modelId} 不在 opencode Zen 的模型列表里；GET /v1/models 是当前真正能用的列表`,
+      };
+    }
+    if (disabled.has(modelId)) return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
+    if (!isSupportedProtocol(modelId)) {
+      return {
+        ok: false,
+        status: 404,
+        message: `模型 ${modelId} 走的是本网关还没实现的上游协议（${protocolNote(modelId)}）；GET /v1/models 是当前真正能用的列表`,
+      };
+    }
+    if (keyRecord?.models?.length && !keyRecord.models.includes(modelId)) {
+      return { ok: false, status: 403, message: `当前 API key 未授权模型 ${modelId}` };
+    }
+    if (tierOf(modelId) === 'paid' && !keyRecord?.allowPaid) {
+      return {
+        ok: false,
+        status: 403,
+        message: `模型 ${modelId} 是 opencode Zen 的按量计费模型（会真的扣你 Zen 账户余额）；当前 API key 没有勾选「允许付费模型」，请在控制台勾上或换用带 -free 的免费模型。`,
+      };
+    }
+    return { ok: true };
+  }
   if (modelId && enginePaused.has(modelId)) {
     return {
       ok: false,
@@ -330,7 +458,6 @@ export function checkModelAccess(keyRecord, modelId) {
       message: `模型 ${modelId} 已被上游暂停提供（引擎 vendor/worker.js 的 PAUSED_MODELS 里有它），换一个模型；GET /v1/models 是当前真正能用的列表`,
     };
   }
-  const disabled = new Set(store.settings?.disabledModels || []);
   if (modelId && disabled.has(modelId)) {
     return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
   }
@@ -359,6 +486,14 @@ export function resolveModelId(raw, isAnthropic = false) {
   const value = String(raw || '').trim();
   if (!value) return '';
   if (table.models.has(value)) return value;
+  // 带 opencode/ 前缀的：只在 opencode 那半张表里找，别掉进下面的后缀匹配
+  if (isOpencodeModel(value)) {
+    const full = withPrefix(stripPrefix(value));
+    return ocTable.has(full) ? full : value;
+  }
+  // 裸的 opencode 模型名（mimo-v2.5-free 这种）也认：它们不含 '/'，
+  // 和 freebuff 的 'vendor/model' 形态天然不会撞
+  if (!value.includes('/') && ocTable.has(OPENCODE_PREFIX + value)) return OPENCODE_PREFIX + value;
   const short = value.replace(/^anthropic\//i, '').toLowerCase();
   for (const id of table.models.keys()) {
     if (id.toLowerCase().endsWith('/' + short)) return id;
@@ -376,10 +511,21 @@ export function filterModelList(keyRecord, list) {
     if (!id || disabled.has(id)) return false;
     if (allow && !allow.has(id)) return false;
     if (!keyRecord?.allowPaid && tierOf(id) === 'paid') return false;
+    if (isOpencodeModel(id)) {
+      if (!isSupportedProtocol(id)) return false; // 协议没实现，列出来只会让客户端拿到必然 400 的 id
+      // 地区挡掉的模型对这个部署来说就是调不通，别塞给客户端
+      if (hideDead && OPENCODE_REGION_LOCKED.has(stripPrefix(id))) return false;
+      return hasOpencodeModel(id);
+    }
     // 实测过、确认上游按模型本身拒绝的，默认不再对外提供 ——
     // 客户端拿到一份"里面有一半调不通"的模型列表毫无用处
     if (enginePaused.has(id)) return false;
     if (hideDead && availabilityOf(id).state === 'unavailable') return false;
     return true;
   });
+}
+
+/** 把 opencode 那半张表也变成 /v1/models 的条目 */
+export function opencodeModelList() {
+  return [...ocTable.keys()].map((id) => ({ id, object: 'model', created: 0, owned_by: 'opencode' }));
 }

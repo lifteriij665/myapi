@@ -10,6 +10,24 @@ import { randomId, generateApiKey, nowIso, constantTimeEqual } from './util.js';
 const scryptAsync = promisify(scrypt);
 const CURRENT_VERSION = 1;
 
+// 号池支持的上游。'freebuff' 走 vendor/worker.js，'opencode' 直连 opencode.ai/zen。
+export const PROVIDERS = ['freebuff', 'opencode'];
+
+/**
+ * 账号属于哪个上游。老数据文件里的账号没有 provider 字段，一律当 freebuff ——
+ * 这个默认值必须放在读取侧而不是只在 load() 里补，因为单测会直接给
+ * store.data.accounts 赋值，绕过 load()。
+ */
+export function providerOf(account) {
+  const p = account?.provider;
+  return PROVIDERS.includes(p) ? p : 'freebuff';
+}
+
+export function normalizeProvider(value) {
+  const p = String(value || '').trim().toLowerCase();
+  return PROVIDERS.includes(p) ? p : 'freebuff';
+}
+
 function emptyData() {
   return {
     version: CURRENT_VERSION,
@@ -63,6 +81,8 @@ class Store {
         this.data = { ...emptyData(), ...parsed };
         this.data.settings = { ...emptyData().settings, ...(parsed.settings || {}) };
         this.data.accounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
+        // 老数据文件里的账号没有 provider，补成 freebuff（这个版本之前只有那一个上游）
+        for (const a of this.data.accounts) if (!PROVIDERS.includes(a?.provider)) a.provider = 'freebuff';
         this.data.keys = Array.isArray(parsed.keys) ? parsed.keys : [];
         this.data.modelStatus = parsed.modelStatus && typeof parsed.modelStatus === 'object' ? parsed.modelStatus : {};
       } catch (err) {
@@ -104,13 +124,36 @@ class Store {
       for (const raw of config.seedTokens.split(/[\n,]/)) {
         const token = raw.trim();
         if (token.length <= 8) continue;
-        if (this.data.accounts.some((a) => a.token === token)) continue;
+        if (this.data.accounts.some((a) => a.token === token && providerOf(a) === 'freebuff')) continue;
         this.data.accounts.push({
           id: randomId(6),
           email: '',
           name: '环境变量导入',
           token,
+          provider: 'freebuff',
           pool: 'any',
+          enabled: true,
+          source: 'env',
+          createdAt: nowIso(),
+          lastUsedAt: null,
+          status: null,
+        });
+        changed = true;
+      }
+    }
+    // opencode Zen 的 key 也支持用环境变量种一批（和 freebuff 的 token 各走各的）
+    if (config.seedOpencodeKeys) {
+      for (const raw of config.seedOpencodeKeys.split(/[\n,]/)) {
+        const token = raw.trim();
+        if (token.length <= 8) continue;
+        if (this.data.accounts.some((a) => a.token === token && providerOf(a) === 'opencode')) continue;
+        this.data.accounts.push({
+          id: randomId(6),
+          email: '',
+          name: '环境变量导入（opencode）',
+          token,
+          provider: 'opencode',
+          pool: 'free',
           enabled: true,
           source: 'env',
           createdAt: nowIso(),
@@ -218,10 +261,13 @@ class Store {
     return this.data.accounts;
   }
 
-  addAccount({ token, email = '', name = '', pool = 'any', source = 'manual', user = null }) {
+  addAccount({ token, email = '', name = '', pool = 'any', source = 'manual', user = null, provider = 'freebuff' }) {
     const clean = String(token || '').trim();
+    const prov = normalizeProvider(provider);
     if (clean.length <= 8) throw Object.assign(new Error('token 太短，不像有效的 authToken'), { statusCode: 400 });
-    const existing = this.data.accounts.find((a) => a.token === clean);
+    // 同一个 token 在不同 provider 下是两条独立记录（凭据格式不同，撞不上；
+    // 但真撞上了也不能把 freebuff 的号悄悄改成 opencode 的）
+    const existing = this.data.accounts.find((a) => a.token === clean && providerOf(a) === prov);
     if (existing) {
       // 同一账号重新登录（token 轮换）时更新信息而不是插一条重复的
       existing.email = email || existing.email;
@@ -232,7 +278,7 @@ class Store {
       this.save();
       return { account: existing, duplicated: true };
     }
-    const sameEmail = email ? this.data.accounts.find((a) => a.email && a.email === email) : null;
+    const sameEmail = email ? this.data.accounts.find((a) => a.email && a.email === email && providerOf(a) === prov) : null;
     if (sameEmail) {
       sameEmail.token = clean;
       sameEmail.name = name || sameEmail.name;
@@ -249,6 +295,7 @@ class Store {
       email,
       name,
       token: clean,
+      provider: prov,
       pool,
       enabled: true,
       source,
@@ -457,12 +504,14 @@ class Store {
     }
     for (const a of Array.isArray(payload.accounts) ? payload.accounts : []) {
       if (!a?.token) continue;
-      if (this.data.accounts.some((x) => x.token === a.token)) continue;
+      const prov = normalizeProvider(a.provider);
+      if (this.data.accounts.some((x) => x.token === a.token && providerOf(x) === prov)) continue;
       this.data.accounts.push({
         id: randomId(6),
         email: a.email || '',
         name: a.name || '',
         token: String(a.token),
+        provider: prov,
         pool: ['any', 'free', 'paid'].includes(a.pool) ? a.pool : 'any',
         enabled: a.enabled !== false,
         source: 'import',

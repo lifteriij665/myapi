@@ -87,14 +87,23 @@ function quotaRatio(text) {
 
 const POOL_LABEL = { any: '全部', free: '仅免费', paid: '付费优先' };
 const POOL_FULL = { any: '全部模型', free: '仅免费模型', paid: '付费模型优先' };
+// 号池里两个上游的标记。opencode 的号是一个 Zen API key，不是登录出来的账号，
+// 所以列表里要能一眼分清 —— 它们的「用途」「检测」含义都不一样。
+const PROVIDER_NAME = { freebuff: 'freebuff', opencode: 'opencode Zen' };
+const PROVIDER_BADGE = {
+  freebuff: '<span class="tag prov">freebuff</span>',
+  opencode: '<span class="tag prov oc">opencode</span>',
+};
 const LAMP_BY_STATE = {
   ok: 'ok',
+  metered: 'ok',
   model_locked: 'warn',
   rate_limited: 'warn',
   ip_capped: 'warn',
   country_blocked: 'warn',
   blocked: 'warn',
   network_error: 'warn',
+  no_credit: 'bad',
   token_invalid: 'bad',
   banned: 'bad',
 };
@@ -274,7 +283,8 @@ function renderUsageTables() {
   }));
   const acctRows = (USAGE.byAccount || []).map((a) => ({
     ...a,
-    label: STATE?.accounts.find((x) => x.id === a.id)?.email || a.id,
+    // 'anon' 不是真账号，是 opencode 的匿名 public 凭据那条路
+    label: a.id === 'anon' ? 'opencode 匿名（public）' : STATE?.accounts.find((x) => x.id === a.id)?.email || a.id,
     kind: '账号',
   }));
   const merged = [...keyRows, ...acctRows];
@@ -455,7 +465,7 @@ function renderOverview(s) {
     return `<div class="ch ${a.active ? 'is-active' : ''}" data-off="${a.enabled ? 0 : 1}" title="${esc(a.status?.detail || '还没检测过')}">
       <div class="ch-top"><i class="lamp ${lampFor(a)}"></i>${a.active ? '<span class="ch-now">当前</span>' : ''}<span class="ch-role">${POOL_LABEL[a.pool] || ''}</span></div>
       <div class="ch-name" title="${esc(label)}">${esc(local)}</div>
-      <div class="ch-host">${esc(host || '—')}</div>
+      <div class="ch-host">${esc(host || PROVIDER_NAME[a.provider || 'freebuff'] || '—')}</div>
       <div class="ch-state" title="${esc(state)}">${esc(state)}</div>
       <div class="ch-meter ${tier}"><i style="width:${ratio === null ? 0 : Math.round(ratio * 100)}%"></i></div>
       <div class="ch-quota">${ratio === null ? '额度未知' : `额度已用 ${Math.round(ratio * 100)}%`}</div>
@@ -505,7 +515,7 @@ function renderAccounts(s) {
       const label = st ? st.verdict : a.workerState ? `引擎观测 ${a.workerState.state}` : '未检测';
       return `<tr data-id="${a.id}" class="${a.enabled ? '' : 'is-off'}">
       <td><div class="cell-main"><b>${esc(a.email || a.name || '未知邮箱')}</b>${a.active ? ' <span class="tag now">当前</span>' : ''}
-        <span class="cell-sub">${esc(a.source)} · ${ago(a.createdAt)}加入</span></div></td>
+        <span class="cell-sub">${PROVIDER_BADGE[a.provider || 'freebuff'] || ''} · ${esc(a.source)} · ${ago(a.createdAt)}加入</span></div></td>
       <td><select class="inline js-pool" title="${esc(POOL_FULL[a.pool] || '')}">
         ${Object.entries(POOL_FULL)
           .map(([v, t]) => `<option value="${v}"${a.pool === v ? ' selected' : ''}>${t}</option>`)
@@ -622,12 +632,18 @@ function renderKeys(s) {
 
 let modelFilter = 'all';
 
+// 「不可用」这一档：真的调不通的都算进来，不然过滤器会漏掉协议没实现和地区受限的
+const DEAD_STATES = ['unavailable', 'paused', 'protocol_unsupported', 'region_locked'];
+
 const AVAIL_LABEL = {
   ok: ['ok', '实测可用'],
   metered: ['ok', '上游有额度记录'],
+  listed: ['ok', '在上游列表里'],
   suspect: ['warn', '失败过一次'],
   unavailable: ['bad', '实测不可用'],
   paused: ['bad', '上游已暂停'],
+  protocol_unsupported: ['bad', '协议未实现'],
+  region_locked: ['warn', '当前地区不可用'],
   unverified: ['', '未验证'],
 };
 
@@ -636,11 +652,15 @@ function renderModels(s) {
   const list = s.models.filter((m) => {
     if (q && !m.id.toLowerCase().includes(q)) return false;
     if (modelFilter === 'all') return true;
-    if (modelFilter === 'dead') return ['unavailable', 'paused'].includes(m.availability?.state);
+    if (modelFilter === 'dead') return DEAD_STATES.includes(m.availability?.state);
+    if (modelFilter === 'opencode') return m.provider === 'opencode';
     return m.tier === modelFilter;
   });
-  const dead = s.models.filter((m) => ['unavailable', 'paused'].includes(m.availability?.state)).length;
-  $('#model-meta').textContent = `免费 ${s.modelStats.free} · 付费 ${s.modelStats.paid}${dead ? ` · 不可用 ${dead}` : ''} · 引擎 ${s.workerVersion || '?'}`;
+  const dead = s.models.filter((m) => DEAD_STATES.includes(m.availability?.state)).length;
+  const ocCount = s.models.filter((m) => m.provider === 'opencode').length;
+  $('#model-meta').textContent =
+    `免费 ${s.modelStats.free} · 付费 ${s.modelStats.paid}${dead ? ` · 不可用 ${dead}` : ''}` +
+    `${ocCount ? ` · opencode ${ocCount}` : ''} · 引擎 ${s.workerVersion || '?'}`;
   $('#model-table tbody').innerHTML = list.length
     ? list
         .map((m) => {
@@ -648,7 +668,7 @@ function renderModels(s) {
           const [cls, label] = AVAIL_LABEL[av.state] || AVAIL_LABEL.unverified;
           return `<tr data-id="${esc(m.id)}">
       <td><div class="cell-main"><b class="cell-mono" style="font-weight:400">${esc(m.id)}</b>
-        <span class="cell-sub">${esc(m.displayName || '—')}${m.limitedOffer ? ' · 限量试用' : ''}${
+        <span class="cell-sub">${PROVIDER_BADGE[m.provider || 'freebuff'] || ''} ${esc(m.displayName || '—')}${m.limitedOffer ? ' · 限量试用' : ''}${
           m.closedWindowUtc ? ` · UTC ${esc(m.closedWindowUtc)} 关闭` : ''
         }</span></div></td>
       <td><select class="inline js-tier">
@@ -1003,22 +1023,29 @@ $('#btn-import').addEventListener('click', () => {
 });
 
 // ─────────────────────────────────────────────── 添加账号
-const poolSelect = (id) => `<label class="field" style="max-width:190px;margin:0">
+// selected：opencode 那个面板默认选「仅免费模型」——Zen 的付费模型是真花钱的，
+// 别让人点两下就把余额挂上去
+const poolSelect = (id, selected = 'any') => `<label class="field" style="max-width:190px;margin:0">
   <span class="lbl">用途</span>
-  <select id="${id}">${Object.entries(POOL_FULL).map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select>
+  <select id="${id}">${Object.entries(POOL_FULL)
+    .map(([v, t]) => `<option value="${v}"${v === selected ? ' selected' : ''}>${t}</option>`)
+    .join('')}</select>
 </label>`;
 
 function openAddAccount() {
   const br = STATE.browser;
+  const oc = STATE.providers?.opencode || {};
   const d = openDialog(
     '添加账号',
     `<div class="methods" id="methods">
       <button class="method is-on" data-m="link" type="button"><b>授权链接</b>
-        <small>在你自己的浏览器里完成登录，服务器只负责收 token。最稳，推荐。</small></button>
+        <small>freebuff：在你自己的浏览器里完成登录，服务器只负责收 token。最稳，推荐。</small></button>
       <button class="method" data-m="browser" type="button"${br.available ? '' : ' disabled'}><b>内置浏览器</b>
-        <small>${br.available ? '服务器开一个 Chromium，画面推到这里，你在这儿点和打字。' : `当前不可用：${esc(br.reason || br.loadError || '未安装 Chromium')}`}</small></button>
+        <small>${br.available ? 'freebuff：服务器开一个 Chromium，画面推到这里，你在这儿点和打字。' : `当前不可用：${esc(br.reason || br.loadError || '未安装 Chromium')}`}</small></button>
       <button class="method" data-m="paste" type="button"><b>粘贴 token</b>
-        <small>已经有 authToken（比如从别处迁移）就直接贴进来。</small></button>
+        <small>freebuff：已经有 authToken（比如从别处迁移）就直接贴进来。</small></button>
+      <button class="method" data-m="opencode" type="button"><b>opencode Zen</b>
+        <small>另一个号池：去 opencode.ai 登录拿一个 API key 贴进来，默认只跑免费模型。</small></button>
     </div>
 
     <div data-p="link">
@@ -1084,6 +1111,41 @@ function openAddAccount() {
       <label class="field" style="margin-top:12px"><span class="lbl">authToken</span>
         <textarea id="mn-token" placeholder="每行一个"></textarea></label>
       <button class="btn primary" id="mn-go" type="button">加入号池</button>
+    </div>
+
+    <div data-p="opencode" class="hidden">
+      <p class="muted small">opencode Zen 是另一个上游（<code>${esc(oc.base || 'https://opencode.ai/zen/v1')}</code>）。
+        它没有授权码登录，官方流程就是「网页登录 → 复制 API key」，所以这里给两条路：自己去复制，或者让服务器开个浏览器带你登。
+        加进来的号<b>默认只服务免费模型</b>，想让它花 Zen 余额得把下面的「用途」改掉。</p>
+      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+        ${poolSelect('oc-pool', 'free')}
+        <button class="btn" id="oc-open" type="button">打开 opencode.ai/zen</button>
+        ${br.available ? '<button class="btn" id="oc-browser" type="button">用内置浏览器登录</button>' : ''}
+      </div>
+      <div class="viewer hidden" id="oc-viewer" style="margin-top:12px">
+        <div class="viewer-bar">
+          <button class="btn tiny" data-ocnav="back" type="button" title="后退">←</button>
+          <button class="btn tiny" data-ocnav="forward" type="button" title="前进">→</button>
+          <button class="btn tiny" data-ocnav="reload" type="button" title="刷新">↻</button>
+          <input type="text" id="oc-url" placeholder="https://" class="grow">
+          <button class="btn tiny" id="oc-go" type="button">前往</button>
+          <span class="pill"><i class="lamp" id="oc-lamp"></i><span id="oc-conn">未连接</span></span>
+        </div>
+        <div class="screen" id="oc-screen" tabindex="0">
+          <img id="oc-img" alt="服务器浏览器画面">
+          <div class="glass" id="oc-glass"></div>
+          <div class="veil" id="oc-veil"><span><span class="spin"></span> 正在启动 Chromium，首次大约 5~15 秒…</span></div>
+        </div>
+        <div class="viewer-bar">
+          <input type="text" id="oc-text" placeholder="要输入的文字 —— 先在画面里点一下输入框，再发送" class="grow">
+          <button class="btn tiny" id="oc-send" type="button">发送文字</button>
+          <button class="btn tiny" id="oc-enter" type="button">回车</button>
+        </div>
+      </div>
+      <label class="field" style="margin-top:12px"><span class="lbl">Zen API key（sk- 开头，一行一个）</span>
+        <textarea id="oc-token" placeholder="sk-…"></textarea></label>
+      <button class="btn primary" id="oc-go2" type="button">加入号池</button>
+      <div class="flowstate" id="oc-state"></div>
     </div>`,
     { width: 1040, onClose: () => teardown() }
   );
@@ -1191,65 +1253,132 @@ function openAddAccount() {
   });
 
   // ── 方式二：内置浏览器 ──
-  const img = $('#br-img', R);
-  const glass = $('#br-glass', R);
-  const screen = $('#br-screen', R);
-  const sendWs = (msg) => {
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
-  };
-
-  // 鼠标位置 → 画面内 0~1 归一化坐标（img 是 contain，要减掉黑边）
-  function norm(ev) {
-    const r = img.getBoundingClientRect();
-    const nw = img.naturalWidth || 1440;
-    const nh = img.naturalHeight || 900;
-    const scale = Math.min(r.width / nw, r.height / nh);
-    const dw = nw * scale;
-    const dh = nh * scale;
-    const clamp = (v) => Math.max(0, Math.min(1, v));
-    return { x: clamp((ev.clientX - (r.left + (r.width - dw) / 2)) / dw), y: clamp((ev.clientY - (r.top + (r.height - dh) / 2)) / dh) };
-  }
-
-  function conn(state, text) {
-    const lamp = $('#br-lamp', R);
-    if (lamp) lamp.className = `lamp ${state}`;
-    const label = $('#br-conn', R);
-    if (label) label.textContent = text;
-  }
-
-  function connect(flowId) {
-    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/admin/ws/browser?flow=${encodeURIComponent(flowId)}`);
-    ws.onopen = () => conn('busy', '等首帧');
-    ws.onmessage = (ev) => {
-      let m;
-      try {
-        m = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
-      if (m.t === 'frame') {
-        img.src = `data:image/jpeg;base64,${m.data}`;
-        $('#br-veil', R).classList.add('hidden');
-        conn('ok', '已连接');
-      } else if (m.t === 'status') {
-        const box = $('#br-url', R);
-        if (document.activeElement !== box) box.value = m.url || '';
-      } else if (m.t === 'closed') {
-        conn('bad', '已断开');
-        const veil = $('#br-veil', R);
-        veil.classList.remove('hidden');
-        veil.innerHTML = '<span>浏览器已关闭。重新点「启动并打开登录页」可以再开一个。</span>';
-      } else if (m.t === 'error') {
-        toast(m.message, 'warn', 6000);
-      }
+  // 画面 + 输入转发这一整套 opencode 那个面板也要用，所以按 id 前缀参数化，
+  // 复制一份出来早晚会两边改不同步。
+  function mountViewer(prefix, { onFrame } = {}) {
+    const img = $(`#${prefix}-img`, R);
+    const glass = $(`#${prefix}-glass`, R);
+    const screen = $(`#${prefix}-screen`, R);
+    if (!screen) return null;
+    const send = (msg) => {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
     };
-    ws.onclose = () => {
-      ws = null;
-      conn('', '未连接');
+
+    // 鼠标位置 → 画面内 0~1 归一化坐标（img 是 contain，要减掉黑边）
+    const norm = (ev) => {
+      const r = img.getBoundingClientRect();
+      const nw = img.naturalWidth || 1440;
+      const nh = img.naturalHeight || 900;
+      const scale = Math.min(r.width / nw, r.height / nh);
+      const dw = nw * scale;
+      const dh = nh * scale;
+      const clamp = (v) => Math.max(0, Math.min(1, v));
+      return {
+        x: clamp((ev.clientX - (r.left + (r.width - dw) / 2)) / dw),
+        y: clamp((ev.clientY - (r.top + (r.height - dh) / 2)) / dh),
+      };
     };
+
+    const conn = (state, text) => {
+      const lamp = $(`#${prefix}-lamp`, R);
+      if (lamp) lamp.className = `lamp ${state}`;
+      const label = $(`#${prefix}-conn`, R);
+      if (label) label.textContent = text;
+    };
+
+    const connect = (flowId) => {
+      ws = new WebSocket(
+        `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/admin/ws/browser?flow=${encodeURIComponent(flowId)}`
+      );
+      ws.onopen = () => conn('busy', '等首帧');
+      ws.onmessage = (ev) => {
+        let m;
+        try {
+          m = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+        if (m.t === 'frame') {
+          img.src = `data:image/jpeg;base64,${m.data}`;
+          $(`#${prefix}-veil`, R).classList.add('hidden');
+          conn('ok', '已连接');
+          onFrame?.();
+        } else if (m.t === 'status') {
+          const box = $(`#${prefix}-url`, R);
+          if (box && document.activeElement !== box) box.value = m.url || '';
+        } else if (m.t === 'closed') {
+          conn('bad', '已断开');
+          const veil = $(`#${prefix}-veil`, R);
+          veil.classList.remove('hidden');
+          veil.innerHTML = '<span>浏览器已关闭。重新点上面的按钮可以再开一个。</span>';
+        } else if (m.t === 'error') {
+          toast(m.message, 'warn', 6000);
+        }
+      };
+      ws.onclose = () => {
+        ws = null;
+        conn('', '未连接');
+      };
+    };
+
+    let lastMove = 0;
+    glass.addEventListener('mousemove', (ev) => {
+      if (Date.now() - lastMove < 45) return;
+      lastMove = Date.now();
+      send({ t: 'move', ...norm(ev) });
+    });
+    glass.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      screen.focus();
+      send({ t: 'down', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
+    });
+    glass.addEventListener('mouseup', (ev) => {
+      ev.preventDefault();
+      send({ t: 'up', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
+    });
+    glass.addEventListener('contextmenu', (ev) => ev.preventDefault());
+    glass.addEventListener(
+      'wheel',
+      (ev) => {
+        ev.preventDefault();
+        send({ t: 'wheel', ...norm(ev), dx: ev.deltaX, dy: ev.deltaY });
+      },
+      { passive: false }
+    );
+    screen.addEventListener('keydown', (ev) => {
+      if (ev.key === 'F5' || (ev.ctrlKey && ev.key === 'r') || ev.key === 'Escape') return;
+      ev.preventDefault();
+      send({ t: 'key', key: ev.key, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey, shift: ev.shiftKey });
+    });
+    screen.addEventListener('paste', (ev) => {
+      const text = ev.clipboardData?.getData('text');
+      if (!text) return;
+      ev.preventDefault();
+      send({ t: 'text', text });
+    });
+    const navAttr = prefix === 'br' ? 'data-nav' : 'data-ocnav';
+    $$(`[${navAttr}]`, R).forEach((b) =>
+      b.addEventListener('click', () => send({ t: b.getAttribute(navAttr) }))
+    );
+    $(`#${prefix}-go`, R)?.addEventListener('click', () => send({ t: 'navigate', url: $(`#${prefix}-url`, R).value }));
+    $(`#${prefix}-url`, R)?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') send({ t: 'navigate', url: ev.target.value });
+    });
+    $(`#${prefix}-send`, R)?.addEventListener('click', () => {
+      const box = $(`#${prefix}-text`, R);
+      if (!box.value) return;
+      send({ t: 'text', text: box.value });
+      box.value = '';
+    });
+    $(`#${prefix}-text`, R)?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') $(`#${prefix}-send`, R).click();
+    });
+    $(`#${prefix}-enter`, R)?.addEventListener('click', () => send({ t: 'key', key: 'Enter' }));
+    return { connect, screen, send };
   }
 
-  if (screen) {
+  const brViewer = mountViewer('br');
+  if (brViewer) {
     $('#br-start', R).addEventListener('click', async () => {
       const btn = $('#br-start', R);
       btn.disabled = true;
@@ -1264,9 +1393,9 @@ function openAddAccount() {
         ).flow;
         renderFlow();
         startPolling();
-        connect(flow.id);
+        brViewer.connect(flow.id);
         $('#br-viewer', R).scrollIntoView({ block: 'nearest' });
-        screen.focus();
+        brViewer.screen.focus();
       } catch (err) {
         toast(err.message, 'err', 9000);
         $('#br-veil', R).innerHTML = `<span>${esc(err.message)}</span>`;
@@ -1275,54 +1404,60 @@ function openAddAccount() {
         btn.textContent = '重新启动';
       }
     });
-
-    let lastMove = 0;
-    glass.addEventListener('mousemove', (ev) => {
-      if (Date.now() - lastMove < 45) return;
-      lastMove = Date.now();
-      sendWs({ t: 'move', ...norm(ev) });
-    });
-    glass.addEventListener('mousedown', (ev) => {
-      ev.preventDefault();
-      screen.focus();
-      sendWs({ t: 'down', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
-    });
-    glass.addEventListener('mouseup', (ev) => {
-      ev.preventDefault();
-      sendWs({ t: 'up', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
-    });
-    glass.addEventListener('contextmenu', (ev) => ev.preventDefault());
-    glass.addEventListener('wheel', (ev) => {
-      ev.preventDefault();
-      sendWs({ t: 'wheel', ...norm(ev), dx: ev.deltaX, dy: ev.deltaY });
-    }, { passive: false });
-    screen.addEventListener('keydown', (ev) => {
-      if (ev.key === 'F5' || (ev.ctrlKey && ev.key === 'r') || ev.key === 'Escape') return;
-      ev.preventDefault();
-      sendWs({ t: 'key', key: ev.key, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey, shift: ev.shiftKey });
-    });
-    screen.addEventListener('paste', (ev) => {
-      const text = ev.clipboardData?.getData('text');
-      if (!text) return;
-      ev.preventDefault();
-      sendWs({ t: 'text', text });
-    });
-    $$('[data-nav]', R).forEach((b) => b.addEventListener('click', () => sendWs({ t: b.dataset.nav })));
-    $('#br-go', R).addEventListener('click', () => sendWs({ t: 'navigate', url: $('#br-url', R).value }));
-    $('#br-url', R).addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') sendWs({ t: 'navigate', url: ev.target.value });
-    });
-    $('#br-send', R).addEventListener('click', () => {
-      const box = $('#br-text', R);
-      if (!box.value) return;
-      sendWs({ t: 'text', text: box.value });
-      box.value = '';
-    });
-    $('#br-text', R).addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') $('#br-send', R).click();
-    });
-    $('#br-enter', R).addEventListener('click', () => sendWs({ t: 'key', key: 'Enter' }));
   }
+
+  // ── 方式四：opencode Zen ──
+  // 上游没有授权码流程（/auth/* 是浏览器回调端点，不是 device code），
+  // 所以只有两条路：用户自己去网页复制 key，或者服务器开个浏览器带他登，
+  // 登完照样是把 key 复制到下面的输入框。
+  const ocViewer = mountViewer('oc');
+  $('#oc-open', R)?.addEventListener('click', () => {
+    window.open(oc.loginUrl || 'https://opencode.ai/zen', '_blank', 'noopener');
+  });
+  $('#oc-browser', R)?.addEventListener('click', async () => {
+    const btn = $('#oc-browser', R);
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin"></span> 启动中';
+    $('#oc-viewer', R).classList.remove('hidden');
+    try {
+      flow = (
+        await api('/login-flow', {
+          method: 'POST',
+          body: { provider: 'opencode', mode: 'browser', pool: $('#oc-pool', R).value, profile: 'fresh' },
+        })
+      ).flow;
+      ocViewer?.connect(flow.id);
+      $('#oc-viewer', R).scrollIntoView({ block: 'nearest' });
+      ocViewer?.screen.focus();
+      $('#oc-state', R).innerHTML =
+        '<i class="lamp busy"></i><span>在画面里登录，然后到 Zen 控制台复制 API key，粘到下面的框里</span>';
+    } catch (err) {
+      toast(err.message, 'err', 9000);
+      $('#oc-veil', R).innerHTML = `<span>${esc(err.message)}</span>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '重新启动';
+    }
+  });
+  $('#oc-go2', R)?.addEventListener('click', async () => {
+    const raw = $('#oc-token', R).value.trim();
+    if (!raw) return toast('先把 API key 粘进来', 'warn');
+    const btn = $('#oc-go2', R);
+    btn.disabled = true;
+    try {
+      const r = await api('/accounts', {
+        method: 'POST',
+        body: { token: raw, provider: 'opencode', pool: $('#oc-pool', R).value, name: 'opencode Zen' },
+      });
+      toast(`已加入 ${r.added} 个 opencode 号`, 'ok');
+      d.close();
+      sync();
+    } catch (err) {
+      toast(err.message, 'err', 8000);
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }
 
 // ─────────────────────────────────────────────── 启动

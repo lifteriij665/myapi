@@ -70,6 +70,7 @@ export const config = {
 
   seedApiKey: (process.env.FREEBUFF_API_KEY || process.env.API_KEY || '').trim(),
   seedTokens: (process.env.FREEBUFF_TOKEN || '').trim(),
+  seedOpencodeKeys: (process.env.OPENCODE_API_KEY || '').trim(),
   allowPaidDefault: bool(process.env.ALLOW_PAID_DEFAULT, false),
   workerDebug: bool(process.env.FREEBUFF_DEBUG, false),
 
@@ -87,6 +88,11 @@ export const config = {
   // 不设闸门的话一个 key 就能把小容器打到 OOM
   maxInflightApi: positiveInt(process.env.MAX_INFLIGHT_API, 32, { min: 1, max: 1024 }),
   upstreamBase: (process.env.CODEBUFF_API || 'https://www.codebuff.com').replace(/\/+$/, ''),
+  // opencode Zen 号池：直接 HTTPS 调，不经过 vendor/worker.js
+  opencodeBase: (process.env.OPENCODE_API || 'https://opencode.ai/zen/v1').replace(/\/+$/, ''),
+  // 没有任何 opencode key 时，是否允许用官方 CLI 的 `public` 匿名凭证调免费模型。
+  // 上游按出口 IP 限流，所以默认开着也不会伤到谁，但共享 IP 上很容易 429。
+  opencodeAnonymous: bool(process.env.OPENCODE_ANONYMOUS, true),
   loginPollTimeoutMs: parseInt(process.env.LOGIN_POLL_TIMEOUT_MS || '600000', 10),
   loginPollIntervalMs: parseInt(process.env.LOGIN_POLL_INTERVAL_MS || '4000', 10),
 

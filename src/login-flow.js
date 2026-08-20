@@ -29,6 +29,7 @@ export function publicFlow(flow) {
     id: flow.id,
     state: flow.state,
     mode: flow.mode,
+    provider: flow.provider || 'freebuff',
     pool: flow.pool,
     loginUrl: flow.loginUrl,
     expiresAt: flow.expiresAt,
@@ -59,6 +60,62 @@ function cleanup() {
       flows.delete(id);
     }
   }
+}
+
+export const OPENCODE_LOGIN_URL = 'https://opencode.ai/zen';
+
+/**
+ * opencode Zen 的"登录"流程。
+ *
+ * 它没有 CLI 授权码那一套（/auth/* 是浏览器回调端点，探过：GET 回 500
+ * "No authorization code found."，也没有 oauth-authorization-server 发现文档），
+ * 官方文档写的就是"登录网页 → 复制 API key → 粘进客户端"。
+ * 所以这里不轮询，只负责把 Zen 控制台开在内置浏览器里，用户登录后把 key
+ * 粘到旁边的输入框（也可以在自己电脑上登录后再粘过来）。
+ */
+export function startOpencodeFlow({ pool = 'free' } = {}) {
+  cleanup();
+  const flow = {
+    id: randomId(6),
+    state: 'pending',
+    mode: 'browser',
+    provider: 'opencode',
+    pool: ['any', 'free', 'paid'].includes(pool) ? pool : 'free',
+    loginUrl: OPENCODE_LOGIN_URL,
+    expiresAt: null,
+    createdAt: Date.now(),
+    deadline: Date.now() + FLOW_TTL_MS,
+    attempts: 0,
+    error: null,
+    account: null,
+    browser: null,
+    log: [],
+  };
+  flows.set(flow.id, flow);
+  log(flow, '已打开 opencode Zen 控制台：登录后在页面里复制 API key，粘到右边的输入框');
+  return flow;
+}
+
+/** opencode 流程的收尾：把用户粘进来的 key 落库 */
+export function finishOpencodeFlow(flow, token, { name = '' } = {}) {
+  const clean = String(token || '').trim();
+  if (clean.length <= 8) {
+    throw Object.assign(new Error('这个 key 太短了，确认整段都复制到了？'), { statusCode: 400 });
+  }
+  const { account, duplicated } = store.addAccount({
+    token: clean,
+    name: name || 'opencode Zen',
+    provider: 'opencode',
+    pool: flow?.pool || 'free',
+    source: 'browser-login',
+  });
+  if (flow) {
+    flow.account = account;
+    flow.state = 'done';
+    log(flow, duplicated ? `已更新已存在的 opencode 号 ${account.id}` : `opencode key 已加入号池（${account.id}）`);
+    if (flow.browser?.close) setTimeout(() => flow.browser?.close?.().catch(() => {}), 3000);
+  }
+  return account;
 }
 
 /** 向上游申请一次登录授权码 */
@@ -103,6 +160,7 @@ export async function startFlow({ mode = 'link', pool = 'any' } = {}) {
     id: randomId(6),
     state: 'pending',
     mode,
+    provider: 'freebuff',
     pool: ['any', 'free', 'paid'].includes(pool) ? pool : 'any',
     fingerprintId: fid,
     fingerprintHash: resp.data.fingerprintHash,

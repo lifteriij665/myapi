@@ -272,5 +272,87 @@ check('请求被暂停的模型给出明确原因', pausedReq.status === 404 && 
 check('默认模型不会是被暂停的那个', !paused.includes(st2.json.defaultModel), String(st2.json.defaultModel));
 check('引擎版本跟 vendor 一致', st2.json.workerVersion === '1.8.10', String(st2.json.workerVersion));
 
+// ── opencode Zen 号池 ──
+// 不依赖真实 Zen 调用：断言的都是目录合并、门禁分流、账号落库这些本地行为。
+const OC_FREE = 'opencode/mimo-v2.5-free';
+const OC_PAID = 'opencode/claude-sonnet-5';
+check(
+  'state 里带 opencode 的接入信息',
+  st2.json.providers?.opencode?.loginUrl === 'https://opencode.ai/zen' && typeof st2.json.providers.opencode.anonymous === 'boolean',
+  JSON.stringify(st2.json.providers)
+);
+const ocModels = st2.json.models.filter((m) => m.provider === 'opencode');
+check('模型目录里合进了 opencode 的模型', ocModels.length >= 8, `opencode 模型 ${ocModels.length} 个`);
+check(
+  'opencode 免费模型标成 free、付费的标成 paid',
+  ocModels.find((m) => m.id === OC_FREE)?.tier === 'free' && ocModels.every((m) => (m.id.endsWith('-free') ? m.tier === 'free' : true)),
+  JSON.stringify(ocModels.map((m) => `${m.id}:${m.tier}`)).slice(0, 300)
+);
+check('freebuff 的模型没被打成 opencode', st2.json.models.some((m) => m.provider === 'freebuff'), '一个 freebuff 模型都没有');
+
+// 这个 KEY 是「全部清理」补出来的默认 key，没勾允许付费
+const ocPaidReq = await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ model: OC_PAID, messages: [{ role: 'user', content: 'x' }] }),
+});
+const ocPaidBody = await ocPaidReq.text();
+check(
+  'Zen 的按量计费模型对免费 key 也是 403',
+  ocPaidReq.status === 403 && /余额|付费/.test(ocPaidBody),
+  `${ocPaidReq.status} ${ocPaidBody.slice(0, 160)}`
+);
+check(
+  '免费 key 的 /v1/models 里没有 opencode 付费模型',
+  !liveIds.includes(OC_PAID) && liveIds.includes(OC_FREE),
+  JSON.stringify(liveIds.filter((i) => i.startsWith('opencode/')))
+);
+check(
+  '免费 key 的模型列表里没有 freebuff 的付费模型',
+  liveIds.filter((i) => !i.startsWith('opencode/')).every((i) => !/luna|v4-pro|minimax|muse-spark|kimi/.test(i)),
+  JSON.stringify(liveIds)
+);
+check(
+  '地区受限的 Zen 模型默认不对外提供',
+  !liveIds.includes('opencode/muse-spark-1.2-contributor-free'),
+  '地区受限的模型漏出去了'
+);
+
+// 加一个假的 Zen key：断言 provider 落库正确、探活给出确定结论、失败时不泄露 key
+const ocAdd = await admin('/accounts', 'POST', { token: 'sk-fake-zen-key-for-integration-test-0000', provider: 'opencode' });
+check('能加 opencode 号', ocAdd.status === 200 && ocAdd.json.added === 1, JSON.stringify(ocAdd.json));
+const st3 = await admin('/state');
+const ocAcct = st3.json.accounts.find((a) => a.id === ocAdd.json.ids[0]);
+check('opencode 号的 provider 落库正确', ocAcct?.provider === 'opencode', JSON.stringify(ocAcct));
+check('opencode 号默认只服务免费模型', ocAcct?.pool === 'free', String(ocAcct?.pool));
+check('opencode 号不跟 worker 的 token 表对账', ocAcct?.workerState === null, JSON.stringify(ocAcct?.workerState));
+check(
+  '加号时顺手探活并给出确定结论',
+  ['token_invalid', 'rate_limited', 'blocked', 'upstream_error', 'unknown', 'ok'].includes(ocAcct?.status?.state),
+  JSON.stringify(ocAcct?.status)
+);
+check('探活结论里不带完整 key', !JSON.stringify(ocAcct?.status || {}).includes('sk-fake-zen-key-for-integration-test-0000'), 'key 泄露到状态里了');
+
+// freebuff 的号一个都没有（前面被全部清理了），此时不带 model 的请求应该落到 Zen 免费模型
+const noModelReq = await raw('/v1/chat/completions', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+  body: JSON.stringify({ messages: [{ role: 'user', content: 'x' }] }),
+});
+check(
+  '池子里只有 opencode 号时，不带 model 的请求不会因为没 freebuff 号而 503',
+  noModelReq.status !== 503,
+  `${noModelReq.status} ${(await noModelReq.text()).slice(0, 160)}`
+);
+
+// opencode 号加进来之后，state 里的默认模型也该跟着换到 Zen 那边
+check(
+  '只有 opencode 号时默认模型是 Zen 的免费模型',
+  String(st3.json.defaultModel).startsWith('opencode/'),
+  String(st3.json.defaultModel)
+);
+
+await admin(`/accounts/${ocAdd.json.ids[0]}`, 'DELETE');
+
 console.log(`\n集成测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

@@ -1,12 +1,14 @@
 // 管理后台 API：/admin/api/*
 // 鉴权：管理员密码 → HMAC 签名 cookie（无状态，重启后仍有效，除非改密码）。
 // 防跨站：cookie 用 SameSite=Lax，另外对带 Origin 的写请求做同源校验。
-import { store } from './store.js';
+import { store, providerOf, PROVIDERS } from './store.js';
 import { config } from './config.js';
 import { catalog, catalogMeta, refreshCatalog, tierOf, defaultModel, noteEngineModelList } from './models.js';
 import { callWorker, eligibleAccounts, workerHealth } from './engine.js';
 import { probeAccount } from './probe.js';
-import { startFlow, getFlow, cancelFlow, publicFlow } from './login-flow.js';
+import { probeOpencodeKey, callOpencode } from './opencode.js';
+import { isOpencodeModel, stripPrefix } from './models-opencode.js';
+import { startFlow, getFlow, cancelFlow, publicFlow, startOpencodeFlow, finishOpencodeFlow } from './login-flow.js';
 import { browserFeature, startBrowserForFlow, getSession } from './browser.js';
 import { usage } from './usage.js';
 import { chatLogStatus, chatLogFiles, recentChats, readChatLogFile, clearChatLog } from './chatlog.js';
@@ -96,11 +98,14 @@ function issueCookie(req) {
 }
 
 function accountView(acct, workerStates) {
-  const wk = workerStates?.get(acct.token.slice(0, 8)) || null;
+  const provider = providerOf(acct);
+  // token 前缀对账只对 freebuff 有意义：那张表是 worker 按 token 前缀记的
+  const wk = provider === 'freebuff' ? workerStates?.get(acct.token.slice(0, 8)) || null : null;
   return {
     id: acct.id,
     email: acct.email || '',
     name: acct.name || '',
+    provider,
     pool: acct.pool || 'any',
     enabled: acct.enabled !== false,
     active: store.settings.activeAccountId === acct.id,
@@ -125,6 +130,12 @@ function keyView(k) {
     lastUsedAt: k.lastUsedAt,
     requests: k.requests || 0,
   };
+}
+
+/** 探活：两个上游的凭据格式和校验方式都不一样，按 provider 分流 */
+async function checkAccount(acct) {
+  if (providerOf(acct) === 'opencode') return probeOpencodeKey(acct.token);
+  return probeAccount(acct.token);
 }
 
 async function liveModelIds() {
@@ -159,6 +170,7 @@ function liveSnapshot() {
     accounts: store.accounts.map((a) => ({
       id: a.id,
       email: a.email || '',
+      provider: providerOf(a),
       active: store.settings.activeAccountId === a.id,
       enabled: a.enabled !== false,
       state: a.status?.state || null,
@@ -183,6 +195,11 @@ async function buildState(req) {
   await refreshCatalog().catch(() => {});
   const models = catalog(await liveModelIds());
   const freeCount = models.filter((m) => m.tier === 'free').length;
+  const byProvider = {};
+  for (const a of store.accounts) {
+    const p = providerOf(a);
+    byProvider[p] = (byProvider[p] || 0) + (a.enabled === false ? 0 : 1);
+  }
   return {
     ok: true,
     version: config.version,
@@ -202,7 +219,15 @@ async function buildState(req) {
     keys: store.keys.map(keyView),
     models,
     modelStats: { total: models.length, free: freeCount, paid: models.length - freeCount, ...catalogMeta() },
-    defaultModel: defaultModel(),
+    defaultModel: defaultModel({ hasFreebuff: store.accounts.some((a) => a.enabled && providerOf(a) === 'freebuff') }),
+    providers: {
+      counts: byProvider,
+      opencode: {
+        base: config.opencodeBase,
+        anonymous: config.opencodeAnonymous,
+        loginUrl: 'https://opencode.ai/zen',
+      },
+    },
     usageSummary: {
       totals: usage.data.totals,
       today: usage.snapshot({ recentLimit: 0 }).today,
@@ -292,7 +317,10 @@ export async function handleAdminApi(req, res, url) {
   if (path === '/accounts' && method === 'POST') {
     const body = await readJson(req, 256 * 1024);
     const raw = String(body.token || '');
-    const pool = body.pool || 'any';
+    const provider = PROVIDERS.includes(body.provider) ? body.provider : 'freebuff';
+    // opencode 号池默认只服务免费模型（用户明确要求）：pool 不传就按 'free' 落库，
+    // 想让它烧 Zen 余额得自己在账号上改成 any/paid
+    const pool = body.pool || (provider === 'opencode' ? 'free' : 'any');
     const tokens = raw.split(/[\s,]+/).map((t) => t.trim()).filter((t) => t.length > 8);
     if (!tokens.length) return sendJson(res, 400, { ok: false, error: '没解析出有效 token' });
     const added = [];
@@ -301,10 +329,19 @@ export async function handleAdminApi(req, res, url) {
         token,
         email: tokens.length === 1 ? String(body.email || '') : '',
         name: tokens.length === 1 ? String(body.name || '') : '',
+        provider,
         pool,
         source: 'manual',
       });
       added.push(account.id);
+    }
+    // opencode 的 key 加完顺手探一次活：它没有"登录"步骤，粘错了得马上看出来
+    if (provider === 'opencode' && added.length === 1) {
+      const acct = store.accounts.find((a) => a.id === added[0]);
+      if (acct) {
+        const result = await probeOpencodeKey(acct.token).catch(() => null);
+        if (result) store.setAccountStatus(acct.id, result);
+      }
     }
     return sendJson(res, 200, { ok: true, added: added.length, ids: added });
   }
@@ -312,7 +349,7 @@ export async function handleAdminApi(req, res, url) {
   if (path === '/accounts/check-all' && method === 'POST') {
     const results = [];
     for (const acct of store.accounts) {
-      const result = await probeAccount(acct.token);
+      const result = await checkAccount(acct);
       store.setAccountStatus(acct.id, result);
       results.push({ id: acct.id, ...result });
     }
@@ -326,7 +363,7 @@ export async function handleAdminApi(req, res, url) {
     if (!acct) return sendJson(res, 404, { ok: false, error: '账号不存在' });
 
     if (acctMatch[2] === '/check' && method === 'POST') {
-      const result = await probeAccount(acct.token);
+      const result = await checkAccount(acct);
       store.setAccountStatus(id, result);
       return sendJson(res, 200, { ok: true, status: store.accounts.find((a) => a.id === id).status });
     }
@@ -407,9 +444,27 @@ export async function handleAdminApi(req, res, url) {
   // --- 登录流程（授权链接 / 内置浏览器）---
   if (path === '/login-flow' && method === 'POST') {
     const body = await readJson(req, 16 * 1024);
+    const provider = PROVIDERS.includes(body.provider) ? body.provider : 'freebuff';
     const mode = body.mode === 'browser' ? 'browser' : 'link';
     if (mode === 'browser' && !browserFeature().available) {
       return sendJson(res, 501, { ok: false, error: browserFeature().reason || '内置浏览器不可用' });
+    }
+    // opencode 没有授权码轮询，只能开页面让用户自己复制 key，所以必须走内置浏览器
+    if (provider === 'opencode') {
+      if (mode !== 'browser') {
+        return sendJson(res, 400, {
+          ok: false,
+          error: 'opencode 没有授权码登录：请直接去 https://opencode.ai/zen 复制 API key 粘进来，或者用内置浏览器登录',
+        });
+      }
+      const flow = startOpencodeFlow({ pool: body.pool });
+      try {
+        await startBrowserForFlow(flow, { profile: body.profile === 'shared' ? 'shared' : 'fresh' });
+      } catch (err) {
+        cancelFlow(flow.id);
+        return sendJson(res, err.statusCode || 500, { ok: false, error: err.message, flow: publicFlow(flow) });
+      }
+      return sendJson(res, 200, { ok: true, flow: publicFlow(flow) });
     }
     let flow;
     try {
@@ -428,12 +483,26 @@ export async function handleAdminApi(req, res, url) {
     return sendJson(res, 200, { ok: true, flow: publicFlow(flow) });
   }
 
-  const flowMatch = path.match(/^\/login-flow\/([\w-]+)(\/cancel|\/browser|\/navigate)?$/);
+  const flowMatch = path.match(/^\/login-flow\/([\w-]+)(\/cancel|\/browser|\/navigate|\/submit-key)?$/);
   if (flowMatch) {
     const flow = getFlow(flowMatch[1]);
     if (!flow) return sendJson(res, 404, { ok: false, error: '登录流程不存在或已过期' });
     const action = flowMatch[2] || '';
     if (method === 'GET' && !action) return sendJson(res, 200, { ok: true, flow: publicFlow(flow) });
+    // 内置浏览器里登录完 opencode，把复制到的 key 交回来
+    if (action === '/submit-key' && method === 'POST') {
+      if (flow.provider !== 'opencode') return sendJson(res, 400, { ok: false, error: '这个流程不是 opencode 登录' });
+      const body = await readJson(req, 16 * 1024);
+      let account;
+      try {
+        account = finishOpencodeFlow(flow, body.token, { name: body.name });
+      } catch (err) {
+        return sendJson(res, err.statusCode || 400, { ok: false, error: err.message });
+      }
+      const result = await probeOpencodeKey(account.token).catch(() => null);
+      if (result) store.setAccountStatus(account.id, result);
+      return sendJson(res, 200, { ok: true, flow: publicFlow(flow), status: result });
+    }
     if (action === '/cancel' && method === 'POST') {
       cancelFlow(flow.id);
       return sendJson(res, 200, { ok: true, flow: publicFlow(flow) });
@@ -480,11 +549,19 @@ export async function handleAdminApi(req, res, url) {
     const accounts = eligibleAccounts(model);
     if (!accounts.length) return sendJson(res, 400, { ok: false, error: '账号池里没有可用账号' });
     const started = Date.now();
-    const resp = await callWorker('/v1/chat/completions', {
-      method: 'POST',
-      tokens: accounts.map((a) => a.token),
-      body: { model, messages: [{ role: 'user', content: String(body.prompt || '只回复两个字：收到') }], stream: false },
-    });
+    const messages = [{ role: 'user', content: String(body.prompt || '只回复两个字：收到') }];
+    // opencode 的模型不经过 vendor/worker.js，自检也得走它自己那条路
+    const resp = isOpencodeModel(model)
+      ? await callOpencode({
+          pathname: '/v1/chat/completions',
+          body: { model: stripPrefix(model), messages, stream: false },
+          token: accounts[0].token,
+        })
+      : await callWorker('/v1/chat/completions', {
+          method: 'POST',
+          tokens: accounts.map((a) => a.token),
+          body: { model, messages, stream: false },
+        });
     const text = await resp.text();
     let reply = '';
     try {

@@ -60,7 +60,7 @@ const hourKey = (ts) => new Date(ts).toISOString().slice(0, 13);
 
 class Usage {
   constructor() {
-    this.data = { version: 1, totals: emptyBucket(), days: {}, hours: {}, models: {}, keys: {}, accounts: {}, firstAt: null, lastAt: null };
+    this.data = { version: 1, totals: emptyBucket(), days: {}, hours: {}, models: {}, keys: {}, accounts: {}, providers: {}, firstAt: null, lastAt: null };
     this.events = [];
     this._timer = null;
     this._loaded = false;
@@ -80,6 +80,7 @@ class Usage {
             models: parsed.models || {},
             keys: parsed.keys || {},
             accounts: parsed.accounts || {},
+            providers: parsed.providers || {},
             firstAt: parsed.firstAt || null,
             lastAt: parsed.lastAt || null,
           };
@@ -135,6 +136,7 @@ class Usage {
     if (e.model) (d.models[e.model] ||= emptyBucket()) && addTo(d.models[e.model], e);
     if (e.keyId) (d.keys[e.keyId] ||= emptyBucket()) && addTo(d.keys[e.keyId], e);
     if (e.accountId) (d.accounts[e.accountId] ||= emptyBucket()) && addTo(d.accounts[e.accountId], e);
+    if (e.provider) (d.providers[e.provider] ||= emptyBucket()) && addTo(d.providers[e.provider], e);
     d.firstAt ||= new Date(ts).toISOString();
     d.lastAt = new Date(ts).toISOString();
     if (Object.keys(d.hours).length > KEEP_HOURS + 6) this.prune();
@@ -224,7 +226,7 @@ class Usage {
   }
 
   reset() {
-    this.data = { version: 1, totals: emptyBucket(), days: {}, hours: {}, models: {}, keys: {}, accounts: {}, firstAt: null, lastAt: null };
+    this.data = { version: 1, totals: emptyBucket(), days: {}, hours: {}, models: {}, keys: {}, accounts: {}, providers: {}, firstAt: null, lastAt: null };
     this.events = [];
     this.saveNow();
   }
@@ -247,6 +249,7 @@ class Usage {
       byModel: this.topBy('models', 20),
       byKey: this.topBy('keys', 20),
       byAccount: this.topBy('accounts', 20),
+      byProvider: this.topBy('providers', 10),
       recent: this.recent(recentLimit),
       eventsHeld: this.events.length,
       eventCap: EVENT_CAP,
