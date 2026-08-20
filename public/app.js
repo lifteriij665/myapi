@@ -94,6 +94,20 @@ const PROVIDER_BADGE = {
   freebuff: '<span class="tag prov">freebuff</span>',
   opencode: '<span class="tag prov oc">opencode</span>',
 };
+
+/** 上游角标。自定义上游的名字是用户起的，从 STATE 里查 */
+function providerBadge(id) {
+  const key = id || 'freebuff';
+  if (PROVIDER_BADGE[key]) return PROVIDER_BADGE[key];
+  const u = (STATE?.providers?.list || []).find((x) => x.id === key);
+  return `<span class="tag prov oc">${esc(u?.name || key)}</span>`;
+}
+
+function providerName(id) {
+  const key = id || 'freebuff';
+  if (PROVIDER_NAME[key]) return PROVIDER_NAME[key];
+  return (STATE?.providers?.list || []).find((x) => x.id === key)?.name || key;
+}
 const LAMP_BY_STATE = {
   ok: 'ok',
   metered: 'ok',
@@ -162,7 +176,7 @@ $('#btn-logout').addEventListener('click', async () => {
 });
 
 // ─────────────────────────────────────────────── 视图切换
-const VIEW_TITLE = { overview: '概览', usage: '用量', accounts: '账号池', keys: 'API Key', models: '模型', settings: '设置' };
+const VIEW_TITLE = { overview: '概览', usage: '用量', upstreams: '上游', accounts: '账号池', keys: 'API Key', models: '模型', settings: '设置' };
 
 /** 数字/字节/时长的统一格式化 —— 表格里全是等宽数字，别让单位到处不一样 */
 const fmtInt = (n) => Number(n || 0).toLocaleString('zh-CN');
@@ -422,12 +436,314 @@ function render() {
     s.accounts.length === 0 ? '号池为空' : `${okCount}/${s.accounts.length} 号可用`;
 
   $('#nc-usage').textContent = fmtCompact(s.usageSummary?.totals?.requests || 0);
+  $('#nc-upstreams').textContent = (s.providers?.list || []).length;
   renderNotice(s);
   renderOverview(s);
+  renderUpstreams(s);
   renderAccounts(s);
   renderKeys(s);
   renderModels(s);
   renderSettings(s);
+}
+
+// ─────────────────────────────────────────────── 上游
+const FORMAT_SHORT = { chat: 'chat', responses: 'responses', anthropic: 'anthropic', gemini: 'gemini' };
+
+function renderUpstreams(s) {
+  const list = s.providers?.list || [];
+  const rotations = s.providers?.rotations || {};
+  const hints = s.providers?.rotationHints || {};
+  $('#upstream-list').innerHTML = list
+    .map((u) => {
+      const modelPills = u.builtin
+        ? ''
+        : `<div class="up-rot"><span>模型清单 · ${u.models.length} 个</span>
+        <div class="up-models">${
+          u.models.length
+            ? u.models
+                .slice(0, 12)
+                .map((m) => `<span class="mpill">${esc(m)}<button class="js-delmodel" data-m="${esc(m)}" title="移除">×</button></span>`)
+                .join('') + (u.models.length > 12 ? `<span class="more">还有 ${u.models.length - 12} 个…</span>` : '')
+            : '<span class="more">还没有模型 —— 点「拉取模型」或「手动添加」</span>'
+        }</div></div>`;
+      return `<article class="up" data-id="${u.id}" data-off="${u.enabled ? 0 : 1}">
+      <div class="up-head">
+        <span class="up-name">${esc(u.name)}</span>
+        <span class="tag prov${u.builtin ? '' : ' oc'}">${esc(FORMAT_SHORT[u.format] || u.format)}</span>
+        ${u.builtin ? '<span class="tag">内置</span>' : ''}
+        ${u.enabled ? '' : '<span class="tag bad">已停用</span>'}
+        <span class="up-acts">
+          <button class="btn tiny js-addkeys">加 Key</button>
+          <button class="btn tiny js-check">检测</button>
+          ${u.builtin ? '' : '<button class="btn tiny js-more" title="更多操作">···</button>'}
+        </span>
+      </div>
+      <div class="up-body">
+        ${u.baseUrl ? `<div class="up-url">${esc(u.baseUrl)}</div>` : ''}
+        ${u.note ? `<p class="up-note">${esc(u.note)}</p>` : ''}
+        <div class="up-stats">
+          <div class="up-stat"><b>${u.accountsEnabled}<i>/${u.accounts}</i></b><span>可用 Key</span></div>
+          ${u.builtin ? '' : `<div class="up-stat ${u.models.length ? '' : 'dim'}"><b>${u.models.length}</b><span>模型</span></div>`}
+          <div class="up-stat dim"><b class="txt">${u.defaultTier === 'free' ? '免费' : '付费'}</b><span>默认分类</span></div>
+        </div>
+        <div class="up-rot">
+          <span>换号策略</span>
+          <div class="rot-seg js-rot">${Object.entries(rotations)
+            .map(
+              ([mode, label]) =>
+                `<button data-mode="${mode}" class="${u.rotation.mode === mode ? 'is-on' : ''}" title="${esc(hints[mode] || '')}">${esc(label)}</button>`
+            )
+            .join('')}</div>
+          <p class="rot-hint">${esc(hints[u.rotation.mode] || '')}</p>
+        </div>
+        ${modelPills}
+        ${
+          u.builtin
+            ? ''
+            : `<div class="up-more hidden">
+          <button class="btn tiny js-fetch">拉取模型</button>
+          <button class="btn tiny js-addmodel">手动添加模型</button>
+          <button class="btn tiny js-edit">编辑</button>
+          <button class="btn tiny js-toggle">${u.enabled ? '停用' : '启用'}</button>
+          <button class="btn tiny danger js-del">删除</button>
+        </div>`
+        }
+      </div>
+    </article>`;
+    })
+    .join('');
+
+  $$('#upstream-list .up').forEach((card) => {
+    const id = card.dataset.id;
+    const u = list.find((x) => x.id === id);
+
+    $('.js-rot', card).addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('button[data-mode]');
+      if (!btn) return;
+      try {
+        await api(`/upstreams/${id}/rotation`, { method: 'POST', body: { mode: btn.dataset.mode } });
+        toast(`${u.name} 的换号策略改成「${rotations[btn.dataset.mode]}」`);
+        sync(true);
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+    });
+
+    $('.js-addkeys', card).addEventListener('click', () => openAddKeys(u));
+    $('.js-more', card)?.addEventListener('click', (ev) => {
+      const box = $('.up-more', card);
+      box.classList.toggle('hidden');
+      ev.currentTarget.classList.toggle('is-open', !box.classList.contains('hidden'));
+    });
+    $('.js-check', card).addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span>';
+      try {
+        const r = await api(`/upstreams/${id}/check`, { method: 'POST' });
+        const ok = (r.results || []).filter((x) => x.state === 'ok').length;
+        toast(`${u.name}：${ok}/${(r.results || []).length} 个 Key 可用`, ok ? 'ok' : 'warn', 6000);
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      btn.disabled = false;
+      btn.textContent = '检测';
+      sync(true);
+    });
+
+    $('.js-fetch', card)?.addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span>';
+      try {
+        const r = await api(`/upstreams/${id}/models/fetch`, { method: 'POST' });
+        toast(`拉到 ${r.count} 个模型`, 'ok');
+        sync(true);
+      } catch (err) {
+        toast(err.message, 'warn', 9000);
+      }
+      btn.disabled = false;
+      btn.textContent = '拉取模型';
+    });
+
+    $('.js-addmodel', card)?.addEventListener('click', () => openAddModels(u));
+    $('.js-edit', card)?.addEventListener('click', () => openUpstreamForm(u));
+    $('.js-toggle', card)?.addEventListener('click', async () => {
+      await api(`/upstreams/${id}`, { method: 'PATCH', body: { enabled: !u.enabled } });
+      sync(true);
+    });
+    $('.js-del', card)?.addEventListener('click', async () => {
+      if (!confirm(`删掉上游「${u.name}」？它名下的 ${u.accounts} 个 Key 会一起删掉。`)) return;
+      const r = await api(`/upstreams/${id}`, { method: 'DELETE' });
+      toast(`已删除，连带清掉 ${r.removedAccounts} 个 Key`);
+      sync();
+    });
+    $$('.js-delmodel', card).forEach((b) =>
+      b.addEventListener('click', async () => {
+        await api(`/upstreams/${id}/models`, { method: 'DELETE', body: { model: b.dataset.m } });
+        sync(true);
+      })
+    );
+  });
+}
+
+/** 添加 / 编辑一个自定义上游 */
+function openUpstreamForm(existing = null) {
+  const editing = Boolean(existing);
+  const formats = STATE.providers?.formats || {};
+  const d = openDialog(
+    editing ? `编辑上游 · ${existing.name}` : '添加自定义上游',
+    `<p class="muted small">填一个 OpenAI / Anthropic / Gemini 兼容的接口地址，选它说哪种协议。网关内部统一以 chat 为中枢格式，所以客户端用什么协议都能打到这个上游。</p>
+    <label class="field"><span class="lbl">名称</span>
+      <input type="text" id="uf-name" placeholder="例如 my-relay（也会当模型 id 的前缀）" value="${editing ? esc(existing.name) : ''}"></label>
+    <label class="field"><span class="lbl">接口地址（到 /v1 这一层，不含 /chat/completions）</span>
+      <input type="text" id="uf-url" placeholder="https://api.example.com/v1" value="${editing ? esc(existing.baseUrl) : ''}"></label>
+    <label class="field"><span class="lbl">协议格式</span>
+      <select id="uf-format">${Object.entries(formats)
+        .map(([v, t]) => `<option value="${v}"${editing && existing.format === v ? ' selected' : ''}>${esc(t)}</option>`)
+        .join('')}</select></label>
+    <label class="field"><span class="lbl">默认分类</span>
+      <select id="uf-tier">
+        <option value="paid"${!editing || existing.defaultTier === 'paid' ? ' selected' : ''}>按付费处理（需要 Key 勾「允许付费」，更安全）</option>
+        <option value="free"${editing && existing.defaultTier === 'free' ? ' selected' : ''}>按免费处理（所有 Key 都能用）</option>
+      </select></label>
+    <label class="field"><span class="lbl">备注（可选）</span>
+      <input type="text" id="uf-note" placeholder="自己看的说明" value="${editing ? esc(existing.note) : ''}"></label>
+    ${
+      editing
+        ? ''
+        : `<label class="field"><span class="lbl">API key（一行一个，可以一次贴几十个）</span>
+      <textarea id="uf-keys" placeholder="sk-..."></textarea></label>`
+    }
+    <div class="btnrow"><button class="btn primary" id="uf-go" type="button">${editing ? '保存' : '创建'}</button></div>`,
+    { width: 640 }
+  );
+  const R = d.root;
+  $('#uf-go', R).addEventListener('click', async () => {
+    const body = {
+      name: $('#uf-name', R).value,
+      baseUrl: $('#uf-url', R).value,
+      format: $('#uf-format', R).value,
+      defaultTier: $('#uf-tier', R).value,
+      note: $('#uf-note', R).value,
+    };
+    if (!editing) body.keys = $('#uf-keys', R).value;
+    const btn = $('#uf-go', R);
+    btn.disabled = true;
+    try {
+      if (editing) {
+        await api(`/upstreams/${existing.id}`, { method: 'PATCH', body });
+        toast('已保存');
+      } else {
+        const r = await api('/upstreams', { method: 'POST', body });
+        toast(`上游已创建${r.addedKeys ? `，加了 ${r.addedKeys} 个 Key` : ''}`, 'ok');
+      }
+      d.close();
+      sync();
+    } catch (err) {
+      toast(err.message, 'err', 8000);
+      btn.disabled = false;
+    }
+  });
+}
+
+/** 往某个上游批量加 key */
+function openAddKeys(u) {
+  const d = openDialog(
+    `给「${u.name}」加 Key`,
+    `<p class="muted small">一行一个，可以一次贴几十个。重复的会自动跳过。${
+      u.builtin ? '' : `这个上游的默认分类是<b>${u.defaultTier === 'free' ? '免费' : '付费'}</b>。`
+    }</p>
+    <label class="field"><span class="lbl">${esc(u.credentialLabel || 'API key')}</span>
+      <textarea id="ak-keys" placeholder="每行一个" style="min-height:150px"></textarea></label>
+    ${poolSelect('ak-pool', u.defaultTier === 'free' ? 'free' : 'any')}
+    <div class="btnrow"><button class="btn primary" id="ak-go" type="button">加入号池</button></div>`,
+    { width: 620 }
+  );
+  const R = d.root;
+  $('#ak-go', R).addEventListener('click', async () => {
+    const btn = $('#ak-go', R);
+    btn.disabled = true;
+    try {
+      const r = await api(`/upstreams/${u.id}/keys`, {
+        method: 'POST',
+        body: { keys: $('#ak-keys', R).value, pool: $('#ak-pool', R).value },
+      });
+      toast(`加了 ${r.added} 个${r.skipped ? `，跳过 ${r.skipped} 个（重复或太短）` : ''}`, 'ok');
+      d.close();
+      sync();
+    } catch (err) {
+      toast(err.message, 'err');
+      btn.disabled = false;
+    }
+  });
+}
+
+/** 手动填模型名 */
+function openAddModels(u) {
+  const d = openDialog(
+    `给「${u.name}」添加模型`,
+    `<p class="muted small">一行一个模型名，填上游认的原名（不用带前缀）。对外暴露时会自动加成
+      <code>${esc(u.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-'))}/模型名</code>，避免和别的上游撞车。</p>
+    <label class="field"><span class="lbl">模型名</span>
+      <textarea id="am-models" placeholder="gpt-4o&#10;gpt-4o-mini" style="min-height:130px"></textarea></label>
+    <label class="row"><input type="checkbox" id="am-replace"><span>替换现有清单（不勾＝追加）</span></label>
+    <div class="btnrow"><button class="btn primary" id="am-go" type="button">添加</button></div>`,
+    { width: 600 }
+  );
+  const R = d.root;
+  $('#am-go', R).addEventListener('click', async () => {
+    try {
+      const r = await api(`/upstreams/${u.id}/models`, {
+        method: 'POST',
+        body: { models: $('#am-models', R).value, replace: $('#am-replace', R).checked },
+      });
+      toast(`清单里现在有 ${r.models.length} 个模型`, 'ok');
+      d.close();
+      sync();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  });
+}
+
+/** 批量把同一个策略套到多个上游 */
+function openBulkRotation() {
+  const list = STATE.providers?.list || [];
+  const rotations = STATE.providers?.rotations || {};
+  const hints = STATE.providers?.rotationHints || {};
+  const d = openDialog(
+    '批量设置换号策略',
+    `<p class="muted small">选一个策略，再勾要套用的上游。不勾就是全部。</p>
+    <label class="field"><span class="lbl">策略</span>
+      <select id="br-mode">${Object.entries(rotations).map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join('')}</select></label>
+    <p class="rot-hint" id="br-hint">${esc(hints.roundrobin || '')}</p>
+    <div class="field"><span class="lbl">套用到</span>
+      <div style="display:flex;flex-direction:column;gap:6px">${list
+        .map(
+          (u) =>
+            `<label class="row"><input type="checkbox" class="js-up" value="${u.id}" checked><span>${esc(u.name)}
+             <small class="muted">（当前：${esc(rotations[u.rotation.mode] || u.rotation.mode)}）</small></span></label>`
+        )
+        .join('')}</div></div>
+    <div class="btnrow"><button class="btn primary" id="br-go" type="button">一键应用</button></div>`,
+    { width: 560 }
+  );
+  const R = d.root;
+  const modeSel = $('#br-mode', R);
+  modeSel.addEventListener('change', () => ($('#br-hint', R).textContent = hints[modeSel.value] || ''));
+  $('#br-go', R).addEventListener('click', async () => {
+    const providers = $$('.js-up', R).filter((c) => c.checked).map((c) => c.value);
+    if (!providers.length) return toast('至少勾一个上游', 'warn');
+    try {
+      const r = await api('/rotation/bulk', { method: 'POST', body: { mode: modeSel.value, providers } });
+      toast(`${r.applied.length} 个上游都改成了「${rotations[modeSel.value]}」`, 'ok');
+      d.close();
+      sync();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  });
 }
 
 function renderNotice(s) {
@@ -452,35 +768,64 @@ function renderOverview(s) {
       }`
     : '去「API Key」新建一个。';
 
-  // 通道条
+  // 通道条：一个上游一条，不是一个 key 一条 ——
+  // 自定义上游动辄几十个 key，逐个画出来只会糊成一片，也看不出重点
   const wrap = $('#channels');
-  const strips = s.accounts.map((a) => {
-    const ratio = quotaRatio(a.status?.quota);
-    const tier = a.pool === 'paid' ? '' : 'free';
-    const label = a.email || a.name || a.id;
-    const at = label.indexOf('@');
-    const local = at > 0 ? label.slice(0, at) : label;
-    const host = at > 0 ? label.slice(at) : '';
-    const state = a.status?.verdict || (a.enabled ? '未检测' : '已停用');
-    return `<div class="ch ${a.active ? 'is-active' : ''}" data-off="${a.enabled ? 0 : 1}" title="${esc(a.status?.detail || '还没检测过')}">
-      <div class="ch-top"><i class="lamp ${lampFor(a)}"></i>${a.active ? '<span class="ch-now">当前</span>' : ''}<span class="ch-role">${POOL_LABEL[a.pool] || ''}</span></div>
-      <div class="ch-name" title="${esc(label)}">${esc(local)}</div>
-      <div class="ch-host">${esc(host || PROVIDER_NAME[a.provider || 'freebuff'] || '—')}</div>
+  const rotLabel = s.providers?.rotations || {};
+  const strips = (s.providers?.list || [])
+    .filter((u) => u.accounts > 0 || u.builtin)
+    .map((u) => {
+      const mine = s.accounts.filter((a) => (a.provider || 'freebuff') === u.id);
+      const alive = mine.filter((a) => a.enabled !== false && (!a.status || a.status.state === 'ok' || a.status.state === 'metered'));
+      const bad = mine.filter((a) => a.status && ['token_invalid', 'banned', 'no_credit'].includes(a.status.state));
+      // 最满的那个额度，画在条上
+      let worst = null;
+      for (const a of mine) {
+        const r = quotaRatio(a.status?.quota);
+        if (r !== null && (worst === null || r > worst)) worst = r;
+      }
+      const lamp = !mine.length ? '' : alive.length ? 'ok' : bad.length === mine.length ? 'bad' : 'warn';
+      const state = !mine.length
+        ? '还没有 Key'
+        : bad.length
+          ? `${alive.length} 可用 · ${bad.length} 失效`
+          : `${alive.length} 个 Key 可用`;
+      return `<div class="ch" data-off="${u.enabled ? 0 : 1}" data-up="${u.id}"
+        title="${esc(u.baseUrl || u.note || u.name)}">
+      <div class="ch-top"><i class="lamp ${lamp}"></i><span class="ch-role">${esc(u.format)}</span></div>
+      <div class="ch-name" title="${esc(u.name)}">${esc(u.name)}</div>
+      <div class="ch-host">${esc(rotLabel[u.rotation.mode] || u.rotation.mode)}</div>
       <div class="ch-state" title="${esc(state)}">${esc(state)}</div>
-      <div class="ch-meter ${tier}"><i style="width:${ratio === null ? 0 : Math.round(ratio * 100)}%"></i></div>
-      <div class="ch-quota">${ratio === null ? '额度未知' : `额度已用 ${Math.round(ratio * 100)}%`}</div>
+      ${
+        worst === null
+          ? ''
+          : `<div class="ch-meter ${u.defaultTier === 'free' ? 'free' : ''}"><i style="width:${Math.round(worst * 100)}%"></i></div>`
+      }
+      <div class="ch-quota">${
+        worst === null
+          ? u.builtin
+            ? '模型表自动维护'
+            : `${u.models.length} 个模型`
+          : `额度已用 ${Math.round(worst * 100)}%`
+      }</div>
     </div>`;
-  });
+    });
   wrap.innerHTML =
     strips.join('') +
-    `<button class="ch ghost" data-act="add-account"><b>+</b><span>${
-      s.accounts.length ? '再加一个号' : '添加账号'
-    }</span></button>`;
+    `<button class="ch ghost" data-act="add-upstream"><b>+</b><span>加一个上游</span></button>`;
+  $$('#channels .ch[data-up]').forEach((el) =>
+    el.addEventListener('click', () => {
+      show('upstreams');
+    })
+  );
 
   const freeCount = s.accounts.filter((a) => a.pool !== 'paid' && a.enabled).length;
   const calls = s.keys.reduce((n, k) => n + (k.requests || 0), 0);
   const activeAcct = s.accounts.find((a) => a.active);
-  const mode = s.settings.autoSwitch === false ? '手动指定' : '用完才换';
+  // 每个上游各有策略，概览里只说"有几种"，细节在「上游」那一页
+  const modes = new Set((s.providers?.list || []).filter((u) => u.accounts > 0).map((u) => u.rotation.mode));
+  const rotLabels = s.providers?.rotations || {};
+  const mode = modes.size === 1 ? rotLabels[[...modes][0]] || [...modes][0] : `${modes.size} 种策略`;
   $('#pool-summary').textContent = s.accounts.length
     ? `${s.accounts.length} 号 · ${freeCount} 个能跑免费模型 · 累计 ${calls} 次调用 · 切换策略：${mode}${
         activeAcct ? ` · 当前 ${activeAcct.email || activeAcct.id}` : ''
@@ -489,7 +834,7 @@ function renderOverview(s) {
 
   // 上手三步（真实顺序，做完了就打勾）
   const steps = [
-    { done: s.accounts.length > 0, label: '把账号加进号池', hint: '授权链接 / 内置浏览器 / 粘贴 token 三种方式' },
+    { done: s.accounts.length > 0, label: '给某个上游加 Key', hint: 'freebuff 走登录，opencode / 自定义上游直接贴 key' },
     { done: s.keys.length > 0, label: '复制 Base URL 和 Key 到客户端', hint: '上面「复制完整配置」一键带走' },
     { done: Boolean(window.__selftestPassed), label: '跑一次自检确认链路通', hint: '右上「运行自检」' },
   ];
@@ -504,18 +849,37 @@ function renderOverview(s) {
   $('#steps-eyebrow').classList.toggle('hidden', allDone);
 }
 
+let acctFilter = 'all';
+
 function renderAccounts(s) {
   const tbody = $('#acct-table tbody');
+  const ups = s.providers?.list || [];
+  // 号多起来之后按上游分组看更清楚；只有一个上游时不显示这排按钮
+  const withAccounts = ups.filter((u) => u.accounts > 0);
+  if (!withAccounts.some((u) => u.id === acctFilter)) acctFilter = 'all';
+  $('#acct-filter').innerHTML =
+    withAccounts.length > 1
+      ? `<button data-f="all" class="${acctFilter === 'all' ? 'is-on' : ''}">全部 ${s.accounts.length}</button>` +
+        withAccounts.map((u) => `<button data-f="${u.id}" class="${acctFilter === u.id ? 'is-on' : ''}">${esc(u.name)} ${u.accounts}</button>`).join('')
+      : '';
+  $$('#acct-filter button').forEach((b) =>
+    b.addEventListener('click', () => {
+      acctFilter = b.dataset.f;
+      renderAccounts(STATE);
+    })
+  );
+
+  const rows = acctFilter === 'all' ? s.accounts : s.accounts.filter((a) => (a.provider || 'freebuff') === acctFilter);
   $('#acct-blank').classList.toggle('hidden', s.accounts.length > 0);
   $('#acct-table').classList.toggle('hidden', s.accounts.length === 0);
-  tbody.innerHTML = s.accounts
+  tbody.innerHTML = rows
     .map((a) => {
       const st = a.status;
       const tagClass = st ? (LAMP_BY_STATE[st.state] === 'ok' ? 'ok' : LAMP_BY_STATE[st.state] === 'bad' ? 'bad' : 'warn') : '';
       const label = st ? st.verdict : a.workerState ? `引擎观测 ${a.workerState.state}` : '未检测';
       return `<tr data-id="${a.id}" class="${a.enabled ? '' : 'is-off'}">
       <td><div class="cell-main"><b>${esc(a.email || a.name || '未知邮箱')}</b>${a.active ? ' <span class="tag now">当前</span>' : ''}
-        <span class="cell-sub">${PROVIDER_BADGE[a.provider || 'freebuff'] || ''} · ${esc(a.source)} · ${ago(a.createdAt)}加入</span></div></td>
+        <span class="cell-sub">${providerBadge(a.provider)} · ${esc(a.source)} · ${ago(a.createdAt)}加入</span></div></td>
       <td><select class="inline js-pool" title="${esc(POOL_FULL[a.pool] || '')}">
         ${Object.entries(POOL_FULL)
           .map(([v, t]) => `<option value="${v}"${a.pool === v ? ' selected' : ''}>${t}</option>`)
@@ -649,18 +1013,32 @@ const AVAIL_LABEL = {
 
 function renderModels(s) {
   const q = ($('#model-search').value || '').trim().toLowerCase();
+  // 过滤器按钮：固定四个 + 每个有模型的上游一个（上游多了才值得单独列）
+  const ups = (s.providers?.list || []).filter((u) => s.models.some((m) => m.provider === u.id));
+  const known = new Set(['all', 'free', 'paid', 'dead', ...ups.map((u) => u.id)]);
+  if (!known.has(modelFilter)) modelFilter = 'all';
+  $('#model-filter').innerHTML =
+    [
+      ['all', '全部'],
+      ['free', '免费'],
+      ['paid', '付费'],
+      ...(ups.length > 1 ? ups.map((u) => [u.id, u.name]) : []),
+      ['dead', '不可用'],
+    ]
+      .map(([f, label]) => `<button data-filter="${f}" class="${modelFilter === f ? 'is-on' : ''}">${esc(label)}</button>`)
+      .join('');
+
   const list = s.models.filter((m) => {
     if (q && !m.id.toLowerCase().includes(q)) return false;
     if (modelFilter === 'all') return true;
     if (modelFilter === 'dead') return DEAD_STATES.includes(m.availability?.state);
-    if (modelFilter === 'opencode') return m.provider === 'opencode';
-    return m.tier === modelFilter;
+    if (modelFilter === 'free' || modelFilter === 'paid') return m.tier === modelFilter;
+    return m.provider === modelFilter;
   });
   const dead = s.models.filter((m) => DEAD_STATES.includes(m.availability?.state)).length;
-  const ocCount = s.models.filter((m) => m.provider === 'opencode').length;
   $('#model-meta').textContent =
     `免费 ${s.modelStats.free} · 付费 ${s.modelStats.paid}${dead ? ` · 不可用 ${dead}` : ''}` +
-    `${ocCount ? ` · opencode ${ocCount}` : ''} · 引擎 ${s.workerVersion || '?'}`;
+    `${ups.length > 1 ? ` · ${ups.length} 个上游` : ''} · 引擎 ${s.workerVersion || '?'}`;
   $('#model-table tbody').innerHTML = list.length
     ? list
         .map((m) => {
@@ -668,7 +1046,7 @@ function renderModels(s) {
           const [cls, label] = AVAIL_LABEL[av.state] || AVAIL_LABEL.unverified;
           return `<tr data-id="${esc(m.id)}">
       <td><div class="cell-main"><b class="cell-mono" style="font-weight:400">${esc(m.id)}</b>
-        <span class="cell-sub">${PROVIDER_BADGE[m.provider || 'freebuff'] || ''} ${esc(m.displayName || '—')}${m.limitedOffer ? ' · 限量试用' : ''}${
+        <span class="cell-sub">${providerBadge(m.provider)} ${esc(m.displayName || '—')}${m.limitedOffer ? ' · 限量试用' : ''}${
           m.closedWindowUtc ? ` · UTC ${esc(m.closedWindowUtc)} 关闭` : ''
         }</span></div></td>
       <td><select class="inline js-tier">
@@ -742,8 +1120,15 @@ $('#btn-model-status-reset').addEventListener('click', async () => {
 });
 
 function renderSettings(s) {
-  const auto = s.settings.autoSwitch !== false;
-  $('#set-autoswitch').checked = auto;
+  // 换号策略总览：一行一个上游，点「去设置」跳到那一页改
+  const rotations = s.providers?.rotations || {};
+  $('#rot-overview').innerHTML = (s.providers?.list || [])
+    .map(
+      (u) => `<div class="wire"><span class="wl">${esc(u.name)}</span>
+      <code>${esc(rotations[u.rotation.mode] || u.rotation.mode)}</code>
+      <span class="muted small">${u.accountsEnabled}/${u.accounts} 号</span></div>`
+    )
+    .join('');
   const sel = $('#set-active');
   const cur = s.settings.activeAccountId || '';
   sel.innerHTML =
@@ -757,13 +1142,12 @@ function renderSettings(s) {
       )
       .join('');
   const activeAcct = s.accounts.find((a) => a.id === cur);
-  $('#rotation-note').textContent = auto
+  const singles = (s.providers?.list || []).filter((u) => u.rotation.mode === 'single');
+  $('#rotation-note').textContent = singles.length
     ? activeAcct
-      ? `现在钉在 ${activeAcct.email || activeAcct.id} 上；它撞额度或者掉线了才会顺延到下一个号。`
-      : '还没钉住任何号：下一次请求会挑第一个可用的，之后就一直用它，直到它失败。'
-    : activeAcct
-      ? `只用 ${activeAcct.email || activeAcct.id}。它不可用时请求直接报错，不会偷偷换号。`
-      : '手动模式下必须指定一个账号，否则所有请求都会返回 503。';
+      ? `${singles.map((u) => u.name).join('、')} 是单号策略：固定用 ${activeAcct.email || activeAcct.name || activeAcct.id}，失败也不换号。`
+      : `${singles.map((u) => u.name).join('、')} 是单号策略，但还没指定账号 —— 会退到那个上游第一个可用的号。`
+    : '当前没有上游用单号策略，这个下拉只作为各上游的起点提示。';
 
   $('#set-allowpaid').checked = Boolean(s.settings.allowPaidDefault);
   $('#s-datadir').textContent = s.storage.dir;
@@ -794,7 +1178,7 @@ function renderSettings(s) {
 
 // ─────────────────────────────────────────────── 概览上的动作
 $('#channels').addEventListener('click', (ev) => {
-  if (ev.target.closest('[data-act="add-account"]')) openAddAccount();
+  if (ev.target.closest('[data-act="add-upstream"]')) openUpstreamForm();
 });
 $('#acct-blank').addEventListener('click', (ev) => {
   if (ev.target.closest('[data-act="add-account"]')) openAddAccount();
@@ -862,7 +1246,6 @@ $('#model-filter').addEventListener('click', (ev) => {
   const btn = ev.target.closest('button');
   if (!btn) return;
   modelFilter = btn.dataset.filter;
-  $$('#model-filter button').forEach((b) => b.classList.toggle('is-on', b === btn));
   renderModels(STATE);
 });
 $('#model-search').addEventListener('input', () => renderModels(STATE));
@@ -883,11 +1266,7 @@ $('#set-allowpaid').addEventListener('change', async (ev) => {
   await api('/settings', { method: 'PATCH', body: { allowPaidDefault: ev.target.checked } });
   toast('已保存');
 });
-$('#set-autoswitch').addEventListener('change', async (ev) => {
-  await api('/settings', { method: 'PATCH', body: { autoSwitch: ev.target.checked } });
-  toast(ev.target.checked ? '当前账号失败时会自动顺延到下一个号' : '已关闭自动切换：只用指定的那个号');
-  sync(true);
-});
+$('#btn-goto-upstreams').addEventListener('click', () => show('upstreams'));
 $('#set-active').addEventListener('change', async (ev) => {
   await api('/settings', { method: 'PATCH', body: { activeAccountId: ev.target.value || null } });
   toast(ev.target.value ? '已指定当前账号' : '已放开指定，下一次请求自己挑');
@@ -1462,6 +1841,8 @@ function openAddAccount() {
 
 // ─────────────────────────────────────────────── 启动
 $('#btn-add-account').addEventListener('click', () => openAddAccount());
+$('#btn-add-upstream').addEventListener('click', () => openUpstreamForm());
+$('#btn-bulk-rotation').addEventListener('click', () => openBulkRotation());
 
 (async () => {
   // 首屏骨架，避免白板

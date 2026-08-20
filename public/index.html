@@ -43,6 +43,7 @@
     <nav class="nav" id="nav">
       <button class="nav-item is-active" data-view="overview"><span>概览</span></button>
       <button class="nav-item" data-view="usage"><span>用量</span><em id="nc-usage">–</em></button>
+      <button class="nav-item" data-view="upstreams"><span>上游</span><em id="nc-upstreams">–</em></button>
       <button class="nav-item" data-view="accounts"><span>账号池</span><em id="nc-accounts">–</em></button>
       <button class="nav-item" data-view="keys"><span>API Key</span><em id="nc-keys">–</em></button>
       <button class="nav-item" data-view="models"><span>模型</span><em id="nc-models">–</em></button>
@@ -154,10 +155,23 @@
       </div>
     </section>
 
+    <!-- ─────────── 上游 ─────────── -->
+    <section class="view hidden" data-view="upstreams">
+      <div class="toolbar">
+        <p class="muted small grow">每个上游一套换号策略，互不干扰。自定义上游 = 接口地址 + 协议格式 + 一批 API key。</p>
+        <span class="toolbar-acts">
+          <button class="btn" id="btn-bulk-rotation">批量设策略</button>
+          <button class="btn primary" id="btn-add-upstream">添加上游</button>
+        </span>
+      </div>
+      <div id="upstream-list" class="cards"></div>
+    </section>
+
     <!-- ─────────── 账号池 ─────────── -->
     <section class="view hidden" data-view="accounts">
       <div class="toolbar">
-        <p class="muted small grow">默认钉住一个号用到失败才换下一个（不轮询，省 session 额度）；「用途」决定这个号接不接付费模型。</p>
+        <div class="seg" id="acct-filter"></div>
+        <span class="grow"></span>
         <span class="toolbar-acts">
           <button class="btn" id="btn-check-all">全部检测</button>
           <button class="btn primary" id="btn-add-account">添加账号</button>
@@ -201,13 +215,7 @@
     <!-- ─────────── 模型 ─────────── -->
     <section class="view hidden" data-view="models">
       <div class="toolbar">
-        <div class="seg" id="model-filter">
-          <button class="is-on" data-filter="all">全部</button>
-          <button data-filter="free">免费</button>
-          <button data-filter="paid">付费</button>
-          <button data-filter="opencode">opencode</button>
-          <button data-filter="dead">不可用</button>
-        </div>
+        <div class="seg" id="model-filter"></div>
         <input type="search" id="model-search" placeholder="搜模型名" class="search">
         <span class="grow"></span>
         <span class="muted small" id="model-meta"></span>
@@ -252,17 +260,14 @@
       <div class="split">
         <div class="panel">
           <div class="panel-title">账号切换</div>
-          <label class="row-toggle">
-            <span>自动切换账号
-              <small class="muted" style="display:block">当前账号失败了（额度用完 / token 失效 / 上游拒绝）才换下一个，不做轮询。关掉就只用下面指定的那一个。</small>
-            </span>
-            <input type="checkbox" class="switch" id="set-autoswitch">
-          </label>
+          <p class="muted small" style="margin:0 0 12px">换号策略现在<b>每个上游各设一套</b>，互不干扰 —— 去「上游」那一页每张卡上直接点。这里只留一个总览和手动指定当前号。</p>
+          <div id="rot-overview" class="wires"></div>
           <label class="field" style="margin-top:14px">
-            <span class="lbl">当前使用的账号</span>
+            <span class="lbl">当前使用的账号（单号策略下生效）</span>
             <select id="set-active"></select>
           </label>
           <p class="muted small" id="rotation-note"></p>
+          <div class="btnrow"><button class="btn" id="btn-goto-upstreams" type="button">去设置换号策略</button></div>
         </div>
 
         <div class="panel">

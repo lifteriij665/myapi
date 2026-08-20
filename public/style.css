@@ -247,6 +247,108 @@ a:hover { text-decoration: underline; }
 }
 @keyframes shimmer { to { background-position: -200% 0; } }
 
+/* ══ 上游卡：一个上游一张，标题行 + 策略段控件 + 模型/号计数 ══ */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; align-items: start; }
+@media (max-width: 780px) { .cards { grid-template-columns: 1fr; } }
+
+.up {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.up[data-off="1"] { opacity: 0.55; }
+.up-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 14px 11px;
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border-bottom: 1px solid var(--edge);
+}
+.up-name { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; }
+.up-head .tag { flex: none; }
+.up-acts { margin-left: auto; display: flex; gap: 6px; flex: none; }
+.up-body { padding: 12px 14px 13px; display: flex; flex-direction: column; gap: 11px; }
+.up-url {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-all;
+  line-height: 1.5;
+}
+.up-note { font-size: 11.5px; color: var(--muted-2); margin: 0; }
+
+/* 计数条：号 / 模型，等宽数字对齐 */
+.up-stats { display: flex; gap: 22px; }
+.up-stat { display: flex; flex-direction: column; gap: 2px; }
+.up-stat b { font-family: var(--mono); font-size: 17px; font-weight: 400; line-height: 1.05; letter-spacing: -0.02em; }
+.up-stat b i { font-style: normal; font-size: 11px; color: var(--muted-2); }
+.up-stat b.txt { font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+.up-stat span { font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted-2); }
+.up-stat.dim b { color: var(--muted-2); }
+
+/* 折叠起来的次要操作 */
+.up-more { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 11px; border-top: 1px dashed var(--edge); }
+.up-acts .js-more { font-family: var(--mono); letter-spacing: 0.1em; padding-left: 7px; padding-right: 7px; }
+.up-acts .js-more.is-open { background: var(--panel-2); border-color: var(--edge-2); color: var(--text); }
+
+/* 策略选择：五个小段，选中的高亮 —— 比下拉框更容易一眼看出当前是哪个 */
+.up-rot { display: flex; flex-direction: column; gap: 6px; }
+.up-rot > span {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+}
+.rot-seg { display: flex; flex-wrap: wrap; gap: 4px; }
+.rot-seg button {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px 9px;
+  color: var(--muted);
+  background: var(--ink-2);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.rot-seg button:hover { color: var(--text); border-color: var(--edge-2); }
+.rot-seg button.is-on {
+  color: var(--ink);
+  background: var(--signal);
+  border-color: var(--signal);
+  font-weight: 500;
+}
+.rot-hint { font-size: 11px; color: var(--muted-2); margin: 0; min-height: 1.4em; }
+
+/* 模型清单：一堆小药丸，带删除 */
+.up-models { display: flex; flex-wrap: wrap; gap: 5px; }
+.mpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 2px 5px 2px 7px;
+  color: var(--muted);
+  background: var(--ink-2);
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+}
+.mpill button {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 1px;
+  color: var(--muted-2);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.mpill button:hover { color: var(--alarm); }
+.up-models .more { font-family: var(--mono); font-size: 10.5px; color: var(--muted-2); align-self: center; }
+
 /* ── 接线行（Base URL / Key 之类的键值）── */
 .wire { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px dashed var(--edge); }
 .wire:last-of-type { border-bottom: 0; }
