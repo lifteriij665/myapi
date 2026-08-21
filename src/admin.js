@@ -157,6 +157,34 @@ async function checkAccount(acct) {
   return probeUpstreamKey(up, acct.token);
 }
 
+/**
+ * 批量探活。串行跑的话 400 个 key 要好几分钟（每个都是一次真实网络往返），
+ * 所以按固定并发跑；上限不能太高，不然会被上游当成扫号。
+ */
+const PROBE_CONCURRENCY = 6;
+
+async function checkAccounts(accounts) {
+  const results = [];
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= accounts.length) return;
+      const acct = accounts[i];
+      try {
+        const result = await checkAccount(acct);
+        store.setAccountStatus(acct.id, result);
+        results.push({ id: acct.id, ...result });
+      } catch (err) {
+        // 单个号探活抛错不能带崩整批
+        results.push({ id: acct.id, state: 'unknown', verdict: '探测失败', detail: err.message });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, accounts.length) }, worker));
+  return results;
+}
+
 async function liveModelIds() {
   try {
     const resp = await callWorker('/v1/models');
@@ -201,6 +229,19 @@ function liveSnapshot() {
   };
 }
 
+/**
+ * 模型表的指纹。只把"会影响渲染"的字段揉进去（id / 分类 / 启停 / 可用状态），
+ * note 和 displayName 这些是从同样的输入算出来的，跟着一起变，不用单独进指纹。
+ */
+function modelFingerprint(models) {
+  let h = 5381;
+  for (const m of models) {
+    const s = `${m.id}|${m.tier}|${m.enabled ? 1 : 0}|${m.availability?.state || ''}|${m.overridden ? 1 : 0}`;
+    for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  }
+  return `${models.length}-${h.toString(36)}`;
+}
+
 async function buildState(req) {
   const base = publicBaseUrl(req);
   let health = null;
@@ -219,6 +260,9 @@ async function buildState(req) {
     const p = providerOf(a);
     byProvider[p] = (byProvider[p] || 0) + (a.enabled === false ? 0 : 1);
   }
+  // 模型表是 /state 里最大的一块（几百个模型时 200KB+），但它几乎不变。
+  // 给它算一个指纹：控制台每 20 秒轮询一次，指纹没变就不用重发。
+  const modelsTag = modelFingerprint(models);
   return {
     ok: true,
     version: config.version,
@@ -236,6 +280,7 @@ async function buildState(req) {
     settings: store.settings,
     accounts: store.accounts.map((a) => accountView(a, workerStates)),
     keys: store.keys.map(keyView),
+    modelsTag,
     models,
     modelStats: { total: models.length, free: freeCount, paid: models.length - freeCount, ...catalogMeta() },
     defaultModel: defaultModel({ hasFreebuff: store.accounts.some((a) => a.enabled && providerOf(a) === 'freebuff') }),
@@ -306,7 +351,15 @@ export async function handleAdminApi(req, res, url) {
   }
 
   if (path === '/state' && method === 'GET') {
-    return sendJson(res, 200, await buildState(req));
+    // 控制台每 20 秒拉一次 /state，模型表却几百 KB 且几乎不变 ——
+    // 带上次拿到的指纹（?models=<tag>）时就不重发，只回一个 modelsUnchanged 标记
+    const known = url.searchParams.get('models') || '';
+    const state = await buildState(req);
+    if (known && known === state.modelsTag) {
+      const { models, ...rest } = state;
+      return sendJson(res, 200, { ...rest, modelsUnchanged: true });
+    }
+    return sendJson(res, 200, state);
   }
 
   if (path === '/password' && method === 'POST') {
@@ -370,12 +423,7 @@ export async function handleAdminApi(req, res, url) {
   }
 
   if (path === '/accounts/check-all' && method === 'POST') {
-    const results = [];
-    for (const acct of store.accounts) {
-      const result = await checkAccount(acct);
-      store.setAccountStatus(acct.id, result);
-      results.push({ id: acct.id, ...result });
-    }
+    const results = await checkAccounts([...store.accounts]);
     return sendJson(res, 200, { ok: true, results });
   }
 
@@ -756,8 +804,11 @@ export async function handleAdminApi(req, res, url) {
       if (!keys.length) return sendJson(res, 400, { ok: false, error: '这个上游还没有 API key，先加一个再拉模型' });
       let ids = null;
       let tried = 0;
-      // 依次试，直到有一个 key 能拉到（有的 key 可能已经废了）
-      for (const acct of keys) {
+      // 依次试，直到有一个 key 能拉到（有的 key 可能已经废了）。
+      // 但最多试 5 个：一个上游可能挂着几十个 key，全试一遍要几分钟，
+      // 而且如果前 5 个都拉不到，基本就是这个上游没实现 /models。
+      const MAX_TRY = 5;
+      for (const acct of keys.slice(0, MAX_TRY)) {
         tried++;
         ids = await fetchUpstreamModels(up, acct.token).catch(() => null);
         if (ids?.length) break;
@@ -810,13 +861,7 @@ export async function handleAdminApi(req, res, url) {
 
     // 逐个探活这个上游名下的 key
     if (action === '/check' && method === 'POST') {
-      const accounts = store.accounts.filter((a) => providerOf(a) === id);
-      const results = [];
-      for (const acct of accounts) {
-        const result = await checkAccount(acct);
-        store.setAccountStatus(acct.id, result);
-        results.push({ id: acct.id, ...result });
-      }
+      const results = await checkAccounts(store.accounts.filter((a) => providerOf(a) === id));
       return sendJson(res, 200, { ok: true, results });
     }
 

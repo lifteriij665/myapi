@@ -398,13 +398,20 @@ function paintSynced() {
 }
 
 async function sync(quiet = false) {
+  // 开着弹窗时跳过后台自动刷新：重建 DOM 会把用户正在填的表单冲掉。
+  // 手动点「刷新」（quiet=false）仍然照做。
+  if (quiet && dialogDepth > 0) return;
   const btn = $('#btn-sync');
   if (!quiet) {
     btn.disabled = true;
     btn.textContent = '刷新中…';
   }
   try {
-    STATE = await api('/state');
+    // 模型表几百 KB 且几乎不变，把上次的指纹带上去，服务端没变就不重发
+    const tag = STATE?.modelsTag ? `?models=${encodeURIComponent(STATE.modelsTag)}` : '';
+    const next = await api(`/state${tag}`);
+    if (next.modelsUnchanged && STATE?.models) next.models = STATE.models;
+    STATE = next;
     lastSync = Date.now();
     render();
     paintSynced();
@@ -515,21 +522,25 @@ function renderUpstreams(s) {
 
   $$('#upstream-list .up').forEach((card) => {
     const id = card.dataset.id;
-    const u = list.find((x) => x.id === id);
+    // 每次点击都从当前 STATE 重新取这个上游：卡片是渲染时生成的，
+    // 但 20 秒的后台刷新会换掉 STATE —— 闭包里抓着旧对象会拿到过期的名字、
+    // 过期的模型清单，甚至一个已经被删掉的上游
+    const live = () => (STATE?.providers?.list || []).find((x) => x.id === id) || u0;
+    const u0 = list.find((x) => x.id === id);
 
     $('.js-rot', card).addEventListener('click', async (ev) => {
       const btn = ev.target.closest('button[data-mode]');
       if (!btn) return;
       try {
         await api(`/upstreams/${id}/rotation`, { method: 'POST', body: { mode: btn.dataset.mode } });
-        toast(`${u.name} 的换号策略改成「${rotations[btn.dataset.mode]}」`);
+        toast(`${live().name} 的换号策略改成「${rotations[btn.dataset.mode]}」`);
         sync(true);
       } catch (err) {
         toast(err.message, 'err');
       }
     });
 
-    $('.js-addkeys', card).addEventListener('click', () => openAddKeys(u));
+    $('.js-addkeys', card).addEventListener('click', () => openAddAccount(live().id));
     $('.js-more', card)?.addEventListener('click', (ev) => {
       const box = $('.up-more', card);
       box.classList.toggle('hidden');
@@ -542,7 +553,7 @@ function renderUpstreams(s) {
       try {
         const r = await api(`/upstreams/${id}/check`, { method: 'POST' });
         const ok = (r.results || []).filter((x) => x.state === 'ok').length;
-        toast(`${u.name}：${ok}/${(r.results || []).length} 个 Key 可用`, ok ? 'ok' : 'warn', 6000);
+        toast(`${live().name}：${ok}/${(r.results || []).length} 个 Key 可用`, ok ? 'ok' : 'warn', 6000);
       } catch (err) {
         toast(err.message, 'err');
       }
@@ -566,14 +577,14 @@ function renderUpstreams(s) {
       btn.textContent = '拉取模型';
     });
 
-    $('.js-addmodel', card)?.addEventListener('click', () => openAddModels(u));
-    $('.js-edit', card)?.addEventListener('click', () => openUpstreamForm(u));
+    $('.js-addmodel', card)?.addEventListener('click', () => openAddModels(live()));
+    $('.js-edit', card)?.addEventListener('click', () => openUpstreamForm(live()));
     $('.js-toggle', card)?.addEventListener('click', async () => {
-      await api(`/upstreams/${id}`, { method: 'PATCH', body: { enabled: !u.enabled } });
+      await api(`/upstreams/${id}`, { method: 'PATCH', body: { enabled: !live().enabled } });
       sync(true);
     });
     $('.js-del', card)?.addEventListener('click', async () => {
-      if (!confirm(`删掉上游「${u.name}」？它名下的 ${u.accounts} 个 Key 会一起删掉。`)) return;
+      if (!confirm(`删掉上游「${live().name}」？它名下的 ${live().accounts} 个 Key 会一起删掉。`)) return;
       const r = await api(`/upstreams/${id}`, { method: 'DELETE' });
       toast(`已删除，连带清掉 ${r.removedAccounts} 个 Key`);
       sync();
@@ -595,7 +606,8 @@ function openUpstreamForm(existing = null) {
     editing ? `编辑上游 · ${existing.name}` : '添加自定义上游',
     `<p class="muted small">填一个 OpenAI / Anthropic / Gemini 兼容的接口地址，选它说哪种协议。网关内部统一以 chat 为中枢格式，所以客户端用什么协议都能打到这个上游。</p>
     <label class="field"><span class="lbl">名称</span>
-      <input type="text" id="uf-name" placeholder="例如 my-relay（也会当模型 id 的前缀）" value="${editing ? esc(existing.name) : ''}"></label>
+      <input type="text" id="uf-name" placeholder="例如 my-relay（也会当模型 id 的前缀）" value="${editing ? esc(existing.name) : ''}">
+      <small class="muted" id="uf-prefix"></small></label>
     <label class="field"><span class="lbl">接口地址（到 /v1 这一层，不含 /chat/completions）</span>
       <input type="text" id="uf-url" placeholder="https://api.example.com/v1" value="${editing ? esc(existing.baseUrl) : ''}"></label>
     <label class="field"><span class="lbl">协议格式</span>
@@ -619,16 +631,31 @@ function openUpstreamForm(existing = null) {
     { width: 640 }
   );
   const R = d.root;
-  $('#uf-go', R).addEventListener('click', async () => {
+  // 名字实时预览模型前缀：填完才发现前缀不是自己想的那个很烦
+  const nameBox = $('#uf-name', R);
+  const preview = $('#uf-prefix', R);
+  const paintPrefix = () => {
+    const v = nameBox.value.trim();
+    preview.textContent = v ? `模型 id 会长这样：${slugOf(v)}/你的模型名` : '';
+  };
+  nameBox.addEventListener('input', paintPrefix);
+  paintPrefix();
+
+  $('#uf-go', R).addEventListener('click', async (ev) => {
+    const name = $('#uf-name', R).value.trim();
+    const url = $('#uf-url', R).value.trim();
+    // 前端先挡一道：后端也校验，但当场提示比等一轮往返舒服
+    if (!url) return toast('接口地址不能为空', 'warn');
+    if (!editing && !name) return toast('给这个上游起个名字（会当模型 id 的前缀）', 'warn');
     const body = {
-      name: $('#uf-name', R).value,
-      baseUrl: $('#uf-url', R).value,
+      name,
+      baseUrl: url,
       format: $('#uf-format', R).value,
       defaultTier: $('#uf-tier', R).value,
       note: $('#uf-note', R).value,
     };
     if (!editing) body.keys = $('#uf-keys', R).value;
-    const btn = $('#uf-go', R);
+    const btn = ev.currentTarget;
     btn.disabled = true;
     try {
       if (editing) {
@@ -679,12 +706,20 @@ function openAddKeys(u) {
   });
 }
 
+/** 上游名 → 模型前缀。必须和后端 upstreams.js 的 slugOf 保持一致 */
+const slugOf = (name) =>
+  String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'upstream';
+
 /** 手动填模型名 */
 function openAddModels(u) {
   const d = openDialog(
     `给「${u.name}」添加模型`,
     `<p class="muted small">一行一个模型名，填上游认的原名（不用带前缀）。对外暴露时会自动加成
-      <code>${esc(u.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-'))}/模型名</code>，避免和别的上游撞车。</p>
+      <code>${esc(slugOf(u.name))}/模型名</code>，避免和别的上游撞车。</p>
     <label class="field"><span class="lbl">模型名</span>
       <textarea id="am-models" placeholder="gpt-4o&#10;gpt-4o-mini" style="min-height:130px"></textarea></label>
     <label class="row"><input type="checkbox" id="am-replace"><span>替换现有清单（不勾＝追加）</span></label>
@@ -692,17 +727,22 @@ function openAddModels(u) {
     { width: 600 }
   );
   const R = d.root;
-  $('#am-go', R).addEventListener('click', async () => {
+  $('#am-go', R).addEventListener('click', async (ev) => {
+    const raw = $('#am-models', R).value.trim();
+    if (!raw) return toast('先填至少一个模型名', 'warn');
+    const btn = ev.currentTarget;
+    btn.disabled = true;
     try {
       const r = await api(`/upstreams/${u.id}/models`, {
         method: 'POST',
-        body: { models: $('#am-models', R).value, replace: $('#am-replace', R).checked },
+        body: { models: raw, replace: $('#am-replace', R).checked },
       });
       toast(`清单里现在有 ${r.models.length} 个模型`, 'ok');
       d.close();
       sync();
     } catch (err) {
       toast(err.message, 'err');
+      btn.disabled = false;
     }
   });
 }
@@ -1309,6 +1349,10 @@ $('#btn-export').addEventListener('click', async () => {
 });
 
 // ─────────────────────────────────────────────── 对话框
+// 开着弹窗的数量。后台刷新会重建整片 DOM 并换掉 STATE，
+// 弹窗又是从 STATE 拿数据填的表单 —— 边填边被刷会很难受，所以开着弹窗就暂停自动刷新。
+let dialogDepth = 0;
+
 function openDialog(title, html, { width = 560, onClose } = {}) {
   const dlg = document.createElement('dialog');
   dlg.style.setProperty('--dlg-w', `${width}px`);
@@ -1316,12 +1360,16 @@ function openDialog(title, html, { width = 560, onClose } = {}) {
     <button class="btn quiet tiny js-x" type="button">关闭</button></div>
     <div class="dlg-body">${html}</div>`;
   $('#dialogs').appendChild(dlg);
+  dialogDepth++;
   dlg.addEventListener('close', () => {
+    dialogDepth = Math.max(0, dialogDepth - 1);
     onClose?.();
     dlg.remove();
   });
   $('.js-x', dlg).addEventListener('click', () => dlg.close());
   dlg.showModal();
+  // 首个可输入元素自动聚焦，省一次点击
+  setTimeout(() => $('input:not([readonly]), textarea, select', dlg)?.focus(), 60);
   return { root: dlg, close: () => dlg.close() };
 }
 
@@ -1427,25 +1475,229 @@ const poolSelect = (id, selected = 'any') => `<label class="field" style="max-wi
     .join('')}</select>
 </label>`;
 
-function openAddAccount() {
-  const br = STATE.browser;
-  const oc = STATE.providers?.opencode || {};
+/** 内置浏览器画面的那一块 HTML（两个弹窗共用，按 id 前缀区分） */
+const viewerMarkup = (p) => `<div class="viewer hidden" id="${p}-viewer">
+  <div class="viewer-bar">
+    <button class="btn tiny" data-nav="back" type="button" title="后退">←</button>
+    <button class="btn tiny" data-nav="forward" type="button" title="前进">→</button>
+    <button class="btn tiny" data-nav="reload" type="button" title="刷新">↻</button>
+    <input type="text" id="${p}-url" placeholder="https://" class="grow">
+    <button class="btn tiny" id="${p}-go" type="button">前往</button>
+    <span class="pill"><i class="lamp" id="${p}-lamp"></i><span id="${p}-conn">未连接</span></span>
+  </div>
+  <div class="screen" id="${p}-screen" tabindex="0">
+    <img id="${p}-img" alt="服务器浏览器画面">
+    <div class="glass" id="${p}-glass"></div>
+    <div class="veil" id="${p}-veil"><span><span class="spin"></span> 正在启动 Chromium，首次大约 5~15 秒…</span></div>
+  </div>
+  <div class="viewer-bar">
+    <input type="text" id="${p}-text" placeholder="要输入的文字 —— 先在画面里点一下输入框，再发送" class="grow">
+    <button class="btn tiny" id="${p}-send" type="button">发送文字</button>
+    <button class="btn tiny" id="${p}-enter" type="button">回车</button>
+  </div>
+</div>`;
+
+/**
+ * 内置浏览器画面 + 输入转发。freebuff 和 opencode 两个弹窗都要用，
+ * 所以提到模块级并按 id 前缀参数化 —— 复制一份出来早晚会两边改不同步。
+ * ws 的所有权留在调用方（它要负责关闭），这里通过 io.get/io.set 存取。
+ */
+function mountViewer(prefix, R, io, { onFrame } = {}) {
+  const img = $(`#${prefix}-img`, R);
+  const glass = $(`#${prefix}-glass`, R);
+  const screen = $(`#${prefix}-screen`, R);
+  if (!screen) return null;
+  const send = (msg) => {
+    const ws = io.get();
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+  };
+
+  // 鼠标位置 → 画面内 0~1 归一化坐标（img 是 contain，要减掉黑边）
+  const norm = (ev) => {
+    const r = img.getBoundingClientRect();
+    const nw = img.naturalWidth || 1440;
+    const nh = img.naturalHeight || 900;
+    const scale = Math.min(r.width / nw, r.height / nh);
+    const dw = nw * scale;
+    const dh = nh * scale;
+    const clamp = (v) => Math.max(0, Math.min(1, v));
+    return {
+      x: clamp((ev.clientX - (r.left + (r.width - dw) / 2)) / dw),
+      y: clamp((ev.clientY - (r.top + (r.height - dh) / 2)) / dh),
+    };
+  };
+
+  const conn = (state, text) => {
+    const lamp = $(`#${prefix}-lamp`, R);
+    if (lamp) lamp.className = `lamp ${state}`;
+    const label = $(`#${prefix}-conn`, R);
+    if (label) label.textContent = text;
+  };
+
+  const connect = (flowId) => {
+    const ws = new WebSocket(
+      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/admin/ws/browser?flow=${encodeURIComponent(flowId)}`
+    );
+    io.set(ws);
+    ws.onopen = () => conn('busy', '等首帧');
+    ws.onmessage = (ev) => {
+      let m;
+      try {
+        m = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (m.t === 'frame') {
+        img.src = `data:image/jpeg;base64,${m.data}`;
+        $(`#${prefix}-veil`, R).classList.add('hidden');
+        conn('ok', '已连接');
+        onFrame?.();
+      } else if (m.t === 'status') {
+        const box = $(`#${prefix}-url`, R);
+        if (box && document.activeElement !== box) box.value = m.url || '';
+      } else if (m.t === 'closed') {
+        conn('bad', '已断开');
+        const veil = $(`#${prefix}-veil`, R);
+        veil.classList.remove('hidden');
+        veil.innerHTML = '<span>浏览器已关闭。重新点上面的按钮可以再开一个。</span>';
+      } else if (m.t === 'error') {
+        toast(m.message, 'warn', 6000);
+      }
+    };
+    ws.onclose = () => {
+      io.set(null);
+      conn('', '未连接');
+    };
+  };
+
+  let lastMove = 0;
+  glass.addEventListener('mousemove', (ev) => {
+    if (Date.now() - lastMove < 45) return;
+    lastMove = Date.now();
+    send({ t: 'move', ...norm(ev) });
+  });
+  glass.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+    screen.focus();
+    send({ t: 'down', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
+  });
+  glass.addEventListener('mouseup', (ev) => {
+    ev.preventDefault();
+    send({ t: 'up', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
+  });
+  glass.addEventListener('contextmenu', (ev) => ev.preventDefault());
+  glass.addEventListener(
+    'wheel',
+    (ev) => {
+      ev.preventDefault();
+      send({ t: 'wheel', ...norm(ev), dx: ev.deltaX, dy: ev.deltaY });
+    },
+    { passive: false }
+  );
+  screen.addEventListener('keydown', (ev) => {
+    if (ev.key === 'F5' || (ev.ctrlKey && ev.key === 'r') || ev.key === 'Escape') return;
+    ev.preventDefault();
+    send({ t: 'key', key: ev.key, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey, shift: ev.shiftKey });
+  });
+  screen.addEventListener('paste', (ev) => {
+    const text = ev.clipboardData?.getData('text');
+    if (!text) return;
+    ev.preventDefault();
+    send({ t: 'text', text });
+  });
+  // 导航按钮限定在这个 viewer 内部找：两个弹窗不会同时存在，
+  // 但限定作用域比按前缀区分属性名稳（以前用 data-nav / data-ocnav 两套，加第三个就得再改一次）
+  const viewer = $(`#${prefix}-viewer`, R);
+  $$('[data-nav]', viewer || R).forEach((b) =>
+    b.addEventListener('click', () => send({ t: b.getAttribute('data-nav') }))
+  );
+  $(`#${prefix}-go`, R)?.addEventListener('click', () => send({ t: 'navigate', url: $(`#${prefix}-url`, R).value }));
+  $(`#${prefix}-url`, R)?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') send({ t: 'navigate', url: ev.target.value });
+  });
+  $(`#${prefix}-send`, R)?.addEventListener('click', () => {
+    const box = $(`#${prefix}-text`, R);
+    if (!box.value) return;
+    send({ t: 'text', text: box.value });
+    box.value = '';
+  });
+  $(`#${prefix}-text`, R)?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') $(`#${prefix}-send`, R).click();
+  });
+  $(`#${prefix}-enter`, R)?.addEventListener('click', () => send({ t: 'key', key: 'Enter' }));
+  return { connect, screen, send };
+  }
+
+/**
+ * 添加账号：**先选上游，再按那个上游自己的方式录入**。
+ * 三种上游的录入方式本来就不一样，混在一排标签里选会让人以为
+ * "授权链接"也能用来加 opencode 的 key。
+ *   freebuff  —— 授权链接 / 内置浏览器 / 粘贴 authToken（三条都保留）
+ *   opencode  —— 直接贴 Zen key，或者用服务器的指纹浏览器登录后复制
+ *   自定义上游 —— 只有贴 key 这一种
+ * preselect 传上游 id 时跳过选择那一步（上游卡上的「加 Key」就是这么进来的）。
+ */
+function openAddAccount(preselect = null) {
+  const list = STATE.providers?.list || [];
+  const picked = preselect ? list.find((u) => u.id === preselect) : null;
+  // 只有一个上游可选时（比如全新部署只有内置那两个）也照样让用户确认一下，
+  // 因为 freebuff 和 opencode 的录入方式差别很大
+  if (!picked) return openPickUpstream(list);
+  if (picked.id === 'freebuff') return openFreebuffAdd(picked);
+  if (picked.id === 'opencode') return openOpencodeAdd(picked);
+  return openAddKeys(picked);
+}
+
+/** 第一步：选上游 */
+function openPickUpstream(list) {
   const d = openDialog(
-    '添加账号',
+    '添加账号 · 先选上游',
+    `<p class="muted small">每个上游的录入方式不一样，先选一个。</p>
+    <div class="picks">${list
+      .map((u) => {
+        const how =
+          u.id === 'freebuff'
+            ? '授权链接登录 / 内置浏览器登录 / 粘贴 authToken'
+            : u.id === 'opencode'
+              ? '贴 Zen API key，或用内置浏览器登录后复制'
+              : `贴 ${esc(u.credentialLabel || 'API key')}（${esc(u.formatLabel || u.format)}）`;
+        return `<button class="pick" data-id="${esc(u.id)}" type="button"${u.enabled ? '' : ' disabled'}>
+        <span class="pick-top"><b>${esc(u.name)}</b>${u.builtin ? '<span class="tag">内置</span>' : `<span class="tag prov oc">${esc(u.format)}</span>`}${
+          u.enabled ? '' : '<span class="tag bad">已停用</span>'
+        }</span>
+        <small>${how}</small>
+        <span class="pick-meta">${u.accountsEnabled}/${u.accounts} 个可用凭据</span>
+      </button>`;
+      })
+      .join('')}</div>
+    <p class="muted small" style="margin-top:14px">想接一个新的第三方接口？去「上游 → 添加上游」先把它建出来。</p>`,
+    { width: 640 }
+  );
+  $$('.pick', d.root).forEach((b) =>
+    b.addEventListener('click', () => {
+      d.close();
+      openAddAccount(b.dataset.id);
+    })
+  );
+}
+
+/** freebuff：三种登录方式，和老版本一致 */
+function openFreebuffAdd() {
+  const br = STATE.browser;
+  const d = openDialog(
+    '添加 freebuff 账号',
     `<div class="methods" id="methods">
       <button class="method is-on" data-m="link" type="button"><b>授权链接</b>
-        <small>freebuff：在你自己的浏览器里完成登录，服务器只负责收 token。最稳，推荐。</small></button>
+        <small>在你自己的浏览器里完成登录，服务器只负责收 token。最稳，推荐。</small></button>
       <button class="method" data-m="browser" type="button"${br.available ? '' : ' disabled'}><b>内置浏览器</b>
-        <small>${br.available ? 'freebuff：服务器开一个 Chromium，画面推到这里，你在这儿点和打字。' : `当前不可用：${esc(br.reason || br.loadError || '未安装 Chromium')}`}</small></button>
+        <small>${br.available ? '服务器开一个 Chromium，画面推到这里，你在这儿点和打字。' : `当前不可用：${esc(br.reason || br.loadError || '未安装 Chromium')}`}</small></button>
       <button class="method" data-m="paste" type="button"><b>粘贴 token</b>
-        <small>freebuff：已经有 authToken（比如从别处迁移）就直接贴进来。</small></button>
-      <button class="method" data-m="opencode" type="button"><b>opencode Zen</b>
-        <small>另一个号池：去 opencode.ai 登录拿一个 API key 贴进来，默认只跑免费模型。</small></button>
+        <small>已经有 authToken（比如从别处迁移）就直接贴进来。</small></button>
     </div>
 
     <div data-p="link">
       <p class="muted small">和官方 CLI 走同一条链路：这里申请一个一次性登录链接，你在自己浏览器里登录 Google 或 GitHub，服务器轮询到 token 后自动入池。</p>
-      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+      <div class="fieldrow">
         ${poolSelect('link-pool')}
         <button class="btn primary" id="link-start" type="button">生成授权链接</button>
       </div>
@@ -1465,7 +1717,7 @@ function openAddAccount() {
       ${
         br.available
           ? `<p class="muted small">画面来自服务器上的 patchright Chromium（${br.headless ? 'headless' : 'headful + Xvfb，指纹更接近真机'}）。鼠标键盘会转发过去；密码这类长文本用下面的输入框发更省事。</p>
-      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+      <div class="fieldrow">
         ${poolSelect('br-pool')}
         <label class="field" style="max-width:200px;margin:0"><span class="lbl">浏览器身份</span>
           <select id="br-profile">
@@ -1474,26 +1726,7 @@ function openAddAccount() {
           </select></label>
         <button class="btn primary" id="br-start" type="button">启动并打开登录页</button>
       </div>
-      <div class="viewer hidden" id="br-viewer">
-        <div class="viewer-bar">
-          <button class="btn tiny" data-nav="back" type="button" title="后退">←</button>
-          <button class="btn tiny" data-nav="forward" type="button" title="前进">→</button>
-          <button class="btn tiny" data-nav="reload" type="button" title="刷新">↻</button>
-          <input type="text" id="br-url" placeholder="https://" class="grow">
-          <button class="btn tiny" id="br-go" type="button">前往</button>
-          <span class="pill"><i class="lamp" id="br-lamp"></i><span id="br-conn">未连接</span></span>
-        </div>
-        <div class="screen" id="br-screen" tabindex="0">
-          <img id="br-img" alt="服务器浏览器画面">
-          <div class="glass" id="br-glass"></div>
-          <div class="veil" id="br-veil"><span><span class="spin"></span> 正在启动 Chromium，首次大约 5~15 秒…</span></div>
-        </div>
-        <div class="viewer-bar">
-          <input type="text" id="br-text" placeholder="要输入的文字 —— 先在画面里点一下输入框，再发送" class="grow">
-          <button class="btn tiny" id="br-send" type="button">发送文字</button>
-          <button class="btn tiny" id="br-enter" type="button">回车</button>
-        </div>
-      </div>
+      ${viewerMarkup('br')}
       <div class="flowstate" id="br-state"></div>
       <div class="flowlog hidden" id="br-log"></div>`
           : `<p class="muted small">内置浏览器没启用，用「授权链接」加号效果完全一样 —— token 走的是同一条链路。</p>`
@@ -1502,45 +1735,10 @@ function openAddAccount() {
 
     <div data-p="paste" class="hidden">
       <p class="muted small">一行一个 authToken，可以一次贴多个。</p>
-      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">${poolSelect('mn-pool')}</div>
+      <div class="fieldrow">${poolSelect('mn-pool')}</div>
       <label class="field" style="margin-top:12px"><span class="lbl">authToken</span>
         <textarea id="mn-token" placeholder="每行一个"></textarea></label>
-      <button class="btn primary" id="mn-go" type="button">加入号池</button>
-    </div>
-
-    <div data-p="opencode" class="hidden">
-      <p class="muted small">opencode Zen 是另一个上游（<code>${esc(oc.base || 'https://opencode.ai/zen/v1')}</code>）。
-        它没有授权码登录，官方流程就是「网页登录 → 复制 API key」，所以这里给两条路：自己去复制，或者让服务器开个浏览器带你登。
-        加进来的号<b>默认只服务免费模型</b>，想让它花 Zen 余额得把下面的「用途」改掉。</p>
-      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
-        ${poolSelect('oc-pool', 'free')}
-        <button class="btn" id="oc-open" type="button">打开 opencode.ai/zen</button>
-        ${br.available ? '<button class="btn" id="oc-browser" type="button">用内置浏览器登录</button>' : ''}
-      </div>
-      <div class="viewer hidden" id="oc-viewer" style="margin-top:12px">
-        <div class="viewer-bar">
-          <button class="btn tiny" data-ocnav="back" type="button" title="后退">←</button>
-          <button class="btn tiny" data-ocnav="forward" type="button" title="前进">→</button>
-          <button class="btn tiny" data-ocnav="reload" type="button" title="刷新">↻</button>
-          <input type="text" id="oc-url" placeholder="https://" class="grow">
-          <button class="btn tiny" id="oc-go" type="button">前往</button>
-          <span class="pill"><i class="lamp" id="oc-lamp"></i><span id="oc-conn">未连接</span></span>
-        </div>
-        <div class="screen" id="oc-screen" tabindex="0">
-          <img id="oc-img" alt="服务器浏览器画面">
-          <div class="glass" id="oc-glass"></div>
-          <div class="veil" id="oc-veil"><span><span class="spin"></span> 正在启动 Chromium，首次大约 5~15 秒…</span></div>
-        </div>
-        <div class="viewer-bar">
-          <input type="text" id="oc-text" placeholder="要输入的文字 —— 先在画面里点一下输入框，再发送" class="grow">
-          <button class="btn tiny" id="oc-send" type="button">发送文字</button>
-          <button class="btn tiny" id="oc-enter" type="button">回车</button>
-        </div>
-      </div>
-      <label class="field" style="margin-top:12px"><span class="lbl">Zen API key（sk- 开头，一行一个）</span>
-        <textarea id="oc-token" placeholder="sk-…"></textarea></label>
-      <button class="btn primary" id="oc-go2" type="button">加入号池</button>
-      <div class="flowstate" id="oc-state"></div>
+      <div class="btnrow"><button class="btn primary" id="mn-go" type="button">加入号池</button></div>
     </div>`,
     { width: 1040, onClose: () => teardown() }
   );
@@ -1647,132 +1845,8 @@ function openAddAccount() {
     }
   });
 
-  // ── 方式二：内置浏览器 ──
-  // 画面 + 输入转发这一整套 opencode 那个面板也要用，所以按 id 前缀参数化，
-  // 复制一份出来早晚会两边改不同步。
-  function mountViewer(prefix, { onFrame } = {}) {
-    const img = $(`#${prefix}-img`, R);
-    const glass = $(`#${prefix}-glass`, R);
-    const screen = $(`#${prefix}-screen`, R);
-    if (!screen) return null;
-    const send = (msg) => {
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
-    };
-
-    // 鼠标位置 → 画面内 0~1 归一化坐标（img 是 contain，要减掉黑边）
-    const norm = (ev) => {
-      const r = img.getBoundingClientRect();
-      const nw = img.naturalWidth || 1440;
-      const nh = img.naturalHeight || 900;
-      const scale = Math.min(r.width / nw, r.height / nh);
-      const dw = nw * scale;
-      const dh = nh * scale;
-      const clamp = (v) => Math.max(0, Math.min(1, v));
-      return {
-        x: clamp((ev.clientX - (r.left + (r.width - dw) / 2)) / dw),
-        y: clamp((ev.clientY - (r.top + (r.height - dh) / 2)) / dh),
-      };
-    };
-
-    const conn = (state, text) => {
-      const lamp = $(`#${prefix}-lamp`, R);
-      if (lamp) lamp.className = `lamp ${state}`;
-      const label = $(`#${prefix}-conn`, R);
-      if (label) label.textContent = text;
-    };
-
-    const connect = (flowId) => {
-      ws = new WebSocket(
-        `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/admin/ws/browser?flow=${encodeURIComponent(flowId)}`
-      );
-      ws.onopen = () => conn('busy', '等首帧');
-      ws.onmessage = (ev) => {
-        let m;
-        try {
-          m = JSON.parse(ev.data);
-        } catch {
-          return;
-        }
-        if (m.t === 'frame') {
-          img.src = `data:image/jpeg;base64,${m.data}`;
-          $(`#${prefix}-veil`, R).classList.add('hidden');
-          conn('ok', '已连接');
-          onFrame?.();
-        } else if (m.t === 'status') {
-          const box = $(`#${prefix}-url`, R);
-          if (box && document.activeElement !== box) box.value = m.url || '';
-        } else if (m.t === 'closed') {
-          conn('bad', '已断开');
-          const veil = $(`#${prefix}-veil`, R);
-          veil.classList.remove('hidden');
-          veil.innerHTML = '<span>浏览器已关闭。重新点上面的按钮可以再开一个。</span>';
-        } else if (m.t === 'error') {
-          toast(m.message, 'warn', 6000);
-        }
-      };
-      ws.onclose = () => {
-        ws = null;
-        conn('', '未连接');
-      };
-    };
-
-    let lastMove = 0;
-    glass.addEventListener('mousemove', (ev) => {
-      if (Date.now() - lastMove < 45) return;
-      lastMove = Date.now();
-      send({ t: 'move', ...norm(ev) });
-    });
-    glass.addEventListener('mousedown', (ev) => {
-      ev.preventDefault();
-      screen.focus();
-      send({ t: 'down', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
-    });
-    glass.addEventListener('mouseup', (ev) => {
-      ev.preventDefault();
-      send({ t: 'up', ...norm(ev), button: ev.button, clickCount: ev.detail || 1 });
-    });
-    glass.addEventListener('contextmenu', (ev) => ev.preventDefault());
-    glass.addEventListener(
-      'wheel',
-      (ev) => {
-        ev.preventDefault();
-        send({ t: 'wheel', ...norm(ev), dx: ev.deltaX, dy: ev.deltaY });
-      },
-      { passive: false }
-    );
-    screen.addEventListener('keydown', (ev) => {
-      if (ev.key === 'F5' || (ev.ctrlKey && ev.key === 'r') || ev.key === 'Escape') return;
-      ev.preventDefault();
-      send({ t: 'key', key: ev.key, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey, shift: ev.shiftKey });
-    });
-    screen.addEventListener('paste', (ev) => {
-      const text = ev.clipboardData?.getData('text');
-      if (!text) return;
-      ev.preventDefault();
-      send({ t: 'text', text });
-    });
-    const navAttr = prefix === 'br' ? 'data-nav' : 'data-ocnav';
-    $$(`[${navAttr}]`, R).forEach((b) =>
-      b.addEventListener('click', () => send({ t: b.getAttribute(navAttr) }))
-    );
-    $(`#${prefix}-go`, R)?.addEventListener('click', () => send({ t: 'navigate', url: $(`#${prefix}-url`, R).value }));
-    $(`#${prefix}-url`, R)?.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') send({ t: 'navigate', url: ev.target.value });
-    });
-    $(`#${prefix}-send`, R)?.addEventListener('click', () => {
-      const box = $(`#${prefix}-text`, R);
-      if (!box.value) return;
-      send({ t: 'text', text: box.value });
-      box.value = '';
-    });
-    $(`#${prefix}-text`, R)?.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') $(`#${prefix}-send`, R).click();
-    });
-    $(`#${prefix}-enter`, R)?.addEventListener('click', () => send({ t: 'key', key: 'Enter' }));
-    return { connect, screen, send };
-  }
-
-  const brViewer = mountViewer('br');
+  const io = { get: () => ws, set: (v) => (ws = v) };
+  const brViewer = mountViewer('br', R, io);
   if (brViewer) {
     $('#br-start', R).addEventListener('click', async () => {
       const btn = $('#br-start', R);
@@ -1800,17 +1874,56 @@ function openAddAccount() {
       }
     });
   }
+}
 
-  // ── 方式四：opencode Zen ──
-  // 上游没有授权码流程（/auth/* 是浏览器回调端点，不是 device code），
-  // 所以只有两条路：用户自己去网页复制 key，或者服务器开个浏览器带他登，
-  // 登完照样是把 key 复制到下面的输入框。
-  const ocViewer = mountViewer('oc');
-  $('#oc-open', R)?.addEventListener('click', () => {
+/**
+ * opencode Zen：两条路 —— 自己去网页复制 key，或者让服务器的指纹浏览器带你登，
+ * 登完把 key 复制到下面的框。
+ * 上游没有授权码流程（`/auth/*` 是浏览器回调端点，GET 会回 500 "No authorization
+ * code found."，也没有 oauth-authorization-server 发现文档），官方文档写的流程
+ * 就是"网页登录 → 复制 API key"，所以最后这一步只能由用户自己完成。
+ */
+function openOpencodeAdd() {
+  const br = STATE.browser;
+  const oc = STATE.providers?.opencode || {};
+  const d = openDialog(
+    '添加 opencode Zen 账号',
+    `<p class="muted small">Zen 的凭据是一个 API key（<code>${esc(oc.base || 'https://opencode.ai/zen/v1')}</code>）。
+      加进来的号<b>默认只服务免费模型</b>，想让它花 Zen 余额得把「用途」改掉。</p>
+    <div class="fieldrow">
+      ${poolSelect('oc-pool', 'free')}
+      <button class="btn" id="oc-open" type="button">在我自己的浏览器里打开</button>
+      ${br.available ? '<button class="btn primary" id="oc-browser" type="button">用服务器的指纹浏览器登录</button>' : ''}
+    </div>
+    ${br.available ? '' : `<p class="muted small">内置浏览器没启用（${esc(br.reason || br.loadError || '未安装 Chromium')}），只能自己去网页复制 key。</p>`}
+    ${viewerMarkup('oc')}
+    <label class="field" style="margin-top:12px"><span class="lbl">Zen API key（sk- 开头，一行一个）</span>
+      <textarea id="oc-token" placeholder="sk-…"></textarea></label>
+    <div class="btnrow"><button class="btn primary" id="oc-go" type="button">加入号池</button></div>
+    <div class="flowstate" id="oc-state"></div>`,
+    { width: 1040, onClose: () => teardown() }
+  );
+
+  const R = d.root;
+  let flow = null;
+  let ws = null;
+  function teardown() {
+    try {
+      ws?.close();
+    } catch {}
+    ws = null;
+    if (flow && flow.state === 'pending') api(`/login-flow/${flow.id}/cancel`, { method: 'POST' }).catch(() => {});
+  }
+
+  const io = { get: () => ws, set: (v) => (ws = v) };
+  const ocViewer = mountViewer('oc', R, io);
+
+  $('#oc-open', R).addEventListener('click', () => {
     window.open(oc.loginUrl || 'https://opencode.ai/zen', '_blank', 'noopener');
   });
-  $('#oc-browser', R)?.addEventListener('click', async () => {
-    const btn = $('#oc-browser', R);
+
+  $('#oc-browser', R)?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
     btn.disabled = true;
     btn.innerHTML = '<span class="spin"></span> 启动中';
     $('#oc-viewer', R).classList.remove('hidden');
@@ -1834,22 +1947,22 @@ function openAddAccount() {
       btn.textContent = '重新启动';
     }
   });
-  $('#oc-go2', R)?.addEventListener('click', async () => {
+
+  $('#oc-go', R).addEventListener('click', async (ev) => {
     const raw = $('#oc-token', R).value.trim();
     if (!raw) return toast('先把 API key 粘进来', 'warn');
-    const btn = $('#oc-go2', R);
+    const btn = ev.currentTarget;
     btn.disabled = true;
     try {
-      const r = await api('/accounts', {
-        method: 'POST',
-        body: { token: raw, provider: 'opencode', pool: $('#oc-pool', R).value, name: 'opencode Zen' },
-      });
-      toast(`已加入 ${r.added} 个 opencode 号`, 'ok');
+      // 服务器浏览器里登进去的，走 flow 收尾（它会顺手探活）；否则直接入池
+      const r = flow
+        ? await api(`/login-flow/${flow.id}/submit-key`, { method: 'POST', body: { token: raw } })
+        : await api('/accounts', { method: 'POST', body: { token: raw, provider: 'opencode', pool: $('#oc-pool', R).value, name: 'opencode Zen' } });
+      toast(r.added ? `已加入 ${r.added} 个 opencode 号` : 'key 已加入号池', 'ok');
       d.close();
       sync();
     } catch (err) {
       toast(err.message, 'err', 8000);
-    } finally {
       btn.disabled = false;
     }
   });

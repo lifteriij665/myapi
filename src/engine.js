@@ -599,12 +599,7 @@ async function dispatchApi(req, res, url) {
   }
   const callUpstream = (acct) => {
     const prov = providerOf(acct);
-    if (customUp && prov === customUp.id) {
-      const bare = stripUpstreamPrefix(requestedModel, customUp);
-      // 归一到中枢格式，再交给适配器翻成上游协议
-      const chatBody = isAnthropic ? anthropicToChat(parsed || {}, bare) : { ...(parsed || {}), model: bare };
-      return callUpstreamApi(customUp, { chatBody, model: bare, apiKey: acct.token });
-    }
+    if (prov === 'freebuff') return worker.fetch(makeRequest(), buildEnv([acct.token], presented));
     if (prov === 'opencode') {
       // 发给 Zen 的模型名不能带我们自己的 opencode/ 前缀
       const bare = stripPrefix(requestedModel || parsed?.model || '');
@@ -616,7 +611,19 @@ async function dispatchApi(req, res, url) {
             : { ...(parsed || {}), model: bare };
       return callOpencode({ pathname, method: req.method, body, req, token: acct.token, modelId: bare });
     }
-    return worker.fetch(makeRequest(), buildEnv([acct.token], presented));
+    // 自定义上游：账号的 provider 必须正好是这次模型所属的那个上游。
+    // 对不上就直接失败，**绝不能落到下面的 worker.fetch** —— 那等于把用户的
+    // 第三方 API key 发给 freebuff 的引擎。理论上 eligibleAccounts 已经按上游筛过了，
+    // 这里是第二道闸。
+    if (!customUp || prov !== customUp.id) {
+      const err = new Error(`账号 ${acct.id} 属于上游 ${prov}，和模型 ${requestedModel} 要求的上游对不上`);
+      err.mismatch = true;
+      throw err;
+    }
+    const bare = stripUpstreamPrefix(requestedModel, customUp);
+    // 归一到中枢格式，再交给适配器翻成上游协议
+    const chatBody = isAnthropic ? anthropicToChat(parsed || {}, bare) : { ...(parsed || {}), model: bare };
+    return callUpstreamApi(customUp, { chatBody, model: bare, apiKey: acct.token });
   };
 
   // 模型列表和 count_tokens 都不碰上游、不占额度，不需要账号

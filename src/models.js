@@ -27,55 +27,44 @@ import {
   nativeProtocol,
 } from './models-opencode.js';
 import { fetchOpencodeModels } from './opencode.js';
-import { listUpstreams, getUpstream } from './upstreams.js';
+import { listUpstreams, getUpstream, slugOf } from './upstreams.js';
 
 // ─────────────────────────── 自定义上游的模型
 //
-// id 形如 `<上游名>/<模型名>`，和 opencode 的 `opencode/xxx` 一个套路：
+// id 形如 `<上游名 slug>/<模型名>`，和 opencode 的 `opencode/xxx` 一个套路：
 // 用前缀把不同上游隔开，避免两家都叫 gpt-4o 时撞车。
-// 前缀取上游的 name（人看得懂），映射到 id 由 upstreamForModel 负责。
+//
+// 这张索引每次请求都要查好几次（tierOf / providerForModel / availabilityOf / noteOf
+// 各查一遍），所以缓存下来，只在上游列表真的变了之后重建。
+export const upstreamSlug = slugOf;
 
-/** 上游名里可能有空格之类，做成前缀时统一收敛成安全字符 */
-export function upstreamSlug(name) {
-  return String(name || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'upstream';
-}
+let idxCache = null;
+let idxStamp = '';
 
-/** 'myrelay/gpt-4o' → 那个上游对象；找不到返回 null */
-export function upstreamForModel(modelId) {
-  const raw = String(modelId || '');
-  const slash = raw.indexOf('/');
-  if (slash <= 0) return null;
-  const prefix = raw.slice(0, slash).toLowerCase();
-  for (const u of listUpstreams()) {
+/** 上游列表的指纹：id + 名字 + 启停 + 模型清单，任一变化都要重建索引 */
+function upstreamStamp(list) {
+  let s = '';
+  for (const u of list) {
     if (u.builtin) continue;
-    if (upstreamSlug(u.name) === prefix && (u.models || []).includes(raw.slice(slash + 1))) return u;
+    s += `${u.id}:${u.name}:${u.enabled !== false ? 1 : 0}:${u.defaultTier}:${u.format}:${(u.models || []).length}|`;
   }
-  return null;
+  return s;
 }
 
-/** 去掉前缀，拿到上游认的裸模型名 */
-export function stripUpstreamPrefix(modelId, upstream) {
-  const raw = String(modelId || '');
-  const prefix = upstreamSlug(upstream?.name) + '/';
-  return raw.toLowerCase().startsWith(prefix) ? raw.slice(prefix.length) : raw;
-}
-
-export function withUpstreamPrefix(upstream, bareId) {
-  return `${upstreamSlug(upstream?.name)}/${bareId}`;
-}
-
-/** 所有自定义上游的模型条目（控制台目录和 /v1/models 都用它） */
-export function customCatalog() {
-  const out = [];
-  for (const u of listUpstreams()) {
-    if (u.builtin || u.enabled === false) continue;
+function customIndex() {
+  const list = listUpstreams();
+  const stamp = upstreamStamp(list);
+  if (idxCache && idxStamp === stamp) return idxCache;
+  const byId = new Map(); // 完整模型 id -> 条目
+  const bySlug = new Map(); // slug -> 上游
+  for (const u of list) {
+    if (u.builtin) continue;
+    const slug = slugOf(u.name);
+    bySlug.set(slug, u);
+    if (u.enabled === false) continue; // 停用的上游不进模型索引，但 slug 仍然占位
     for (const bare of u.models || []) {
-      out.push({
-        id: withUpstreamPrefix(u, bare),
+      byId.set(`${slug}/${bare}`, {
+        id: `${slug}/${bare}`,
         bare,
         upstreamId: u.id,
         upstreamName: u.name,
@@ -84,7 +73,38 @@ export function customCatalog() {
       });
     }
   }
-  return out;
+  idxCache = { byId, bySlug, list };
+  idxStamp = stamp;
+  return idxCache;
+}
+
+/** 上游改动之后主动作废索引（upstreams.js 那边改完会调） */
+export function invalidateUpstreamIndex() {
+  idxCache = null;
+  idxStamp = '';
+}
+
+/** 'my-relay/gpt-4o' → 那个上游对象；找不到返回 null */
+export function upstreamForModel(modelId) {
+  const raw = String(modelId || '');
+  const entry = customIndex().byId.get(raw);
+  return entry ? getUpstream(entry.upstreamId) : null;
+}
+
+/** 去掉前缀，拿到上游认的裸模型名 */
+export function stripUpstreamPrefix(modelId, upstream) {
+  const raw = String(modelId || '');
+  const prefix = slugOf(upstream?.name) + '/';
+  return raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+}
+
+export function withUpstreamPrefix(upstream, bareId) {
+  return `${slugOf(upstream?.name)}/${bareId}`;
+}
+
+/** 所有自定义上游的模型条目（控制台目录和 /v1/models 都用它） */
+export function customCatalog() {
+  return [...customIndex().byId.values()];
 }
 
 export function customModelList() {
@@ -92,17 +112,20 @@ export function customModelList() {
 }
 
 function customEntry(modelId) {
-  const u = upstreamForModel(modelId);
-  if (!u) return null;
-  const bare = stripUpstreamPrefix(modelId, u);
-  return {
-    id: modelId,
-    bare,
-    upstreamId: u.id,
-    upstreamName: u.name,
-    format: u.format,
-    tier: u.defaultTier === 'free' ? 'free' : 'paid',
-  };
+  return customIndex().byId.get(String(modelId || '')) || null;
+}
+
+/**
+ * 这个模型 id 的前缀是不是某个**已停用**上游的？
+ * 停用的上游不进模型索引（它的模型不该对外提供），但请求到了要能说清原因。
+ */
+function idleUpstreamFor(modelId) {
+  const raw = String(modelId || '');
+  const slash = raw.indexOf('/');
+  if (slash <= 0) return null;
+  const u = customIndex().bySlug.get(raw.slice(0, slash));
+  if (!u || u.enabled !== false) return null;
+  return (u.models || []).includes(raw.slice(slash + 1)) ? u : null;
 }
 
 const RELEASE_SOURCES = [
@@ -562,10 +585,6 @@ export function checkModelAccess(keyRecord, modelId) {
   const custom = customEntry(modelId);
   if (custom) {
     if (disabled.has(modelId)) return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
-    const up = getUpstream(custom.upstreamId);
-    if (!up || up.enabled === false) {
-      return { ok: false, status: 503, message: `上游「${custom.upstreamName}」已停用，去控制台重新启用或换一个模型` };
-    }
     if (keyRecord?.models?.length && !keyRecord.models.includes(modelId)) {
       return { ok: false, status: 403, message: `当前 API key 未授权模型 ${modelId}` };
     }
@@ -577,6 +596,12 @@ export function checkModelAccess(keyRecord, modelId) {
       };
     }
     return { ok: true };
+  }
+  // 停用的上游不进模型索引，所以上面查不到 —— 这里单独认一下前缀，
+  // 好给出"上游已停用"而不是含糊的"模型不存在"
+  const idle = idleUpstreamFor(modelId);
+  if (idle) {
+    return { ok: false, status: 503, message: `上游「${idle.name}」已停用，去控制台重新启用或换一个模型` };
   }
   if (modelId && enginePaused.has(modelId)) {
     return {
@@ -654,11 +679,12 @@ export function filterModelList(keyRecord, list) {
     }
     const custom = customEntry(id);
     if (custom) {
-      const up = getUpstream(custom.upstreamId);
-      if (!up || up.enabled === false) return false;
+      // 停用的上游根本不进索引，所以能查到就说明它是启用的
       if (hideDead && availabilityOf(id).state === 'unavailable') return false;
       return true;
     }
+    // 前缀属于某个停用上游 → 不对外提供
+    if (idleUpstreamFor(id)) return false;
     // 实测过、确认上游按模型本身拒绝的，默认不再对外提供 ——
     // 客户端拿到一份"里面有一半调不通"的模型列表毫无用处
     if (enginePaused.has(id)) return false;

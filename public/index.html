@@ -257,33 +257,41 @@
 
     <!-- ─────────── 设置 ─────────── -->
     <section class="view hidden" data-view="settings">
+      <!-- 分三组：路由行为 / 数据 / 这台机器。原来八张不相关的面板挤在一个
+           auto-fit 网格里，高度参差不齐也看不出哪几项是一类的 -->
+      <div class="eyebrow"><b>路由行为</b><span>ROUTING</span></div>
       <div class="split">
         <div class="panel">
-          <div class="panel-title">账号切换</div>
-          <p class="muted small" style="margin:0 0 12px">换号策略现在<b>每个上游各设一套</b>，互不干扰 —— 去「上游」那一页每张卡上直接点。这里只留一个总览和手动指定当前号。</p>
+          <div class="panel-title">换号策略总览</div>
+          <p class="muted small tight">策略<b>每个上游各设一套</b>，互不干扰 —— 在「上游」那一页每张卡上直接点。</p>
           <div id="rot-overview" class="wires"></div>
-          <label class="field" style="margin-top:14px">
-            <span class="lbl">当前使用的账号（单号策略下生效）</span>
-            <select id="set-active"></select>
-          </label>
-          <p class="muted small" id="rotation-note"></p>
           <div class="btnrow"><button class="btn" id="btn-goto-upstreams" type="button">去设置换号策略</button></div>
         </div>
 
         <div class="panel">
-          <div class="panel-title">默认行为</div>
+          <div class="panel-title">单号策略用哪个号</div>
+          <label class="field">
+            <span class="lbl">当前使用的账号</span>
+            <select id="set-active"></select>
+          </label>
+          <p class="muted small tight" id="rotation-note"></p>
+          <div class="sep"></div>
           <label class="row-toggle">
-            <span>新建 Key 时默认允许付费模型</span>
+            <span>新建 Key 时默认允许付费模型
+              <small class="muted">只影响以后新建的 Key，不改动已有的。</small>
+            </span>
             <input type="checkbox" class="switch" id="set-allowpaid">
           </label>
-          <p class="muted small">只影响以后新建的 Key，不改动已有的。</p>
         </div>
+      </div>
 
+      <div class="eyebrow"><b>数据</b><span>DATA</span></div>
+      <div class="split">
         <div class="panel">
           <div class="panel-title">聊天记录</div>
           <label class="row-toggle">
             <span>把每次请求的消息和回复存下来
-              <small class="muted" style="display:block">默认关。打开后你和模型说过的每句话都会落到磁盘（<code>chatlog/*.jsonl</code>），自用复盘或者拿去训练都行 —— 但它就是明文，注意别把数据目录暴露出去。</small>
+              <small class="muted">默认关。打开后你和模型说过的每句话都会落到磁盘（<code>chatlog/*.jsonl</code>），自用复盘或者拿去训练都行 —— 但它就是明文，注意别把数据目录暴露出去。</small>
             </span>
             <input type="checkbox" class="switch" id="set-chatlog">
           </label>
@@ -297,7 +305,7 @@
 
         <div class="panel">
           <div class="panel-title">存储清理</div>
-          <div class="wire"><span class="wl">数据目录</span><code id="s-store-total">—</code></div>
+          <div class="wire"><span class="wl">已占用</span><code id="s-store-total">—</code></div>
           <div class="wire"><span class="wl">磁盘剩余</span><code id="s-disk">—</code></div>
           <div id="s-store-items" class="storelist"></div>
           <div class="btnrow">
@@ -305,31 +313,34 @@
             <button class="btn" data-clean="deep">清除不必要数据</button>
             <button class="btn danger" data-clean="full">全部清理</button>
           </div>
-          <p class="muted small">日常＝只删聊天记录和浏览器缓存，用量统计留着；不必要＝再加上用量统计和账号状态；全部＝连账号和 Key 都删（管理密码一定保留，不然你就进不来了）。</p>
+          <p class="muted small tight">日常＝只删聊天记录和浏览器缓存，用量统计留着；不必要＝再加上用量统计和账号状态；全部＝连账号和 Key 都删（管理密码一定保留，不然你就进不来了）。</p>
         </div>
 
         <div class="panel">
-          <div class="panel-title">存储</div>
+          <div class="panel-title">备份</div>
           <div class="wire"><span class="wl">数据目录</span><code id="s-datadir">—</code></div>
           <div class="wire"><span class="wl">持久性</span><code id="s-persist">—</code></div>
-          <p class="muted small" id="s-persist-note"></p>
+          <p class="muted small tight" id="s-persist-note"></p>
           <div class="btnrow">
             <button class="btn" id="btn-export">导出备份</button>
             <button class="btn" id="btn-import">导入备份</button>
           </div>
         </div>
+      </div>
 
+      <div class="eyebrow"><b>这台机器</b><span>RUNTIME</span></div>
+      <div class="split">
         <div class="panel">
           <div class="panel-title">内置浏览器</div>
           <div class="wire"><span class="wl">状态</span><code id="s-browser">—</code></div>
           <div class="wire"><span class="wl">代理</span><code id="s-proxy">—</code></div>
-          <p class="muted small">headful（Xvfb）模式下 patchright 的指纹最接近真机；关掉内置浏览器可以省内存，加号改用授权链接。</p>
+          <p class="muted small tight">headful（Xvfb）模式下 patchright 的指纹最接近真机；关掉内置浏览器可以省内存，加号改用授权链接。</p>
         </div>
 
         <div class="panel">
           <div class="panel-title">访问</div>
           <div class="wire"><span class="wl">登录凭证</span><code id="s-creds">—</code></div>
-          <p class="muted small">拿到管理密码等于拿到号池里所有 token，别用弱密码。</p>
+          <p class="muted small tight">拿到管理密码等于拿到号池里所有凭据，别用弱密码。</p>
           <div class="btnrow">
             <button class="btn" id="btn-passwd">修改管理密码</button>
             <button class="btn" id="btn-logout-all">登出所有设备</button>

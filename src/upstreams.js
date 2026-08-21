@@ -130,14 +130,48 @@ export function normalizeBaseUrl(raw) {
   return u.toString().replace(/\/+$/, '');
 }
 
+/**
+ * 上游名会被收敛成模型 id 的前缀（`My Relay` → `my-relay/`），所以判重必须
+ * 按 **slug** 而不是原名 —— 否则「My Relay」和「my-relay」能同时存在，
+ * 它们的模型 id 一模一样，upstreamForModel 只会命中先建的那个，
+ * 后建的那个上游的模型永远调不通，而且报错还看不出原因。
+ * 这个函数必须和 models.js 的 upstreamSlug 保持一致。
+ */
+export function slugOf(name) {
+  return (
+    String(name || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'upstream'
+  );
+}
+
+function assertNameFree(label, exceptId) {
+  const slug = slugOf(label);
+  // 前缀不能和内置上游撞：opencode/ 是 Zen 的命名空间，freebuff 的模型是 厂商/模型 形态
+  if (slug === 'opencode' || slug === 'freebuff') {
+    throw Object.assign(new Error(`「${label}」和内置上游的名字冲突，换一个`), { statusCode: 400 });
+  }
+  const clash = customList().find((u) => u.id !== exceptId && slugOf(u.name) === slug);
+  if (clash) {
+    throw Object.assign(
+      new Error(
+        clash.name === label
+          ? `已经有一个叫「${label}」的上游了，换个名字`
+          : `「${label}」和已有的「${clash.name}」会生成同一个模型前缀 ${slug}/，换个名字`
+      ),
+      { statusCode: 400 }
+    );
+  }
+}
+
 export function addUpstream({ name, format, baseUrl, note = '', models = [], defaultTier = 'paid' }) {
   const fmt = FORMATS.includes(format) ? format : null;
   if (!fmt) throw Object.assign(new Error('协议格式必须是 chat / responses / anthropic / gemini 之一'), { statusCode: 400 });
   const clean = normalizeBaseUrl(baseUrl);
   const label = String(name || '').trim() || new URL(clean).hostname;
-  if (customList().some((u) => u.name === label)) {
-    throw Object.assign(new Error(`已经有一个叫「${label}」的上游了，换个名字`), { statusCode: 400 });
-  }
+  assertNameFree(label, null);
   const up = {
     id: 'up_' + randomId(4),
     name: label,
@@ -175,10 +209,13 @@ export function updateUpstream(id, patch) {
   if (up.builtin) throw Object.assign(new Error('内置上游不能改'), { statusCode: 400 });
   if ('name' in patch) {
     const label = String(patch.name || '').trim();
-    if (label && customList().some((u) => u.id !== id && u.name === label)) {
-      throw Object.assign(new Error(`已经有一个叫「${label}」的上游了`), { statusCode: 400 });
+    if (label && label !== up.name) {
+      assertNameFree(label, id);
+      // 改名会改掉模型前缀，所以要把旧前缀的下架/分类覆盖一起迁过去，
+      // 不然用户之前的手动设置会变成指向一个不存在的 id 的死数据
+      renamePrefix(slugOf(up.name), slugOf(label), up.models || []);
+      up.name = label;
     }
-    if (label) up.name = label;
   }
   if ('baseUrl' in patch) up.baseUrl = normalizeBaseUrl(patch.baseUrl);
   if ('format' in patch && FORMATS.includes(patch.format)) up.format = patch.format;
@@ -191,11 +228,35 @@ export function updateUpstream(id, patch) {
   return up;
 }
 
+/** 改名 / 删上游时，把设置里指向老模型 id 的那些条目一起搬走或清掉 */
+function renamePrefix(oldSlug, newSlug, models) {
+  if (oldSlug === newSlug) return;
+  const s = store.data.settings;
+  const map = (id) => (id.startsWith(oldSlug + '/') ? newSlug + '/' + id.slice(oldSlug.length + 1) : id);
+  if (Array.isArray(s.disabledModels)) s.disabledModels = s.disabledModels.map(map);
+  if (s.modelTierOverrides && typeof s.modelTierOverrides === 'object') {
+    const next = {};
+    for (const [id, tier] of Object.entries(s.modelTierOverrides)) next[map(id)] = tier;
+    s.modelTierOverrides = next;
+  }
+  // 实测状态也跟着搬，不然改个名字所有模型都变回"未验证"
+  if (store.data.modelStatus && typeof store.data.modelStatus === 'object') {
+    const next = {};
+    for (const [id, st] of Object.entries(store.data.modelStatus)) next[map(id)] = st;
+    store.data.modelStatus = next;
+  }
+  // key 上的模型白名单也是按 id 存的
+  for (const k of store.data.keys || []) {
+    if (Array.isArray(k.models) && k.models.length) k.models = k.models.map(map);
+  }
+  void models;
+}
+
 /** 删上游：连它名下的号一起删（留着也没有上游可用） */
 export function removeUpstream(id) {
   const idx = customList().findIndex((u) => u.id === id);
   if (idx < 0) return false;
-  customList().splice(idx, 1);
+  const [gone] = customList().splice(idx, 1);
   const before = store.data.accounts.length;
   store.data.accounts = store.data.accounts.filter((a) => providerOf(a) !== id);
   const removedAccounts = before - store.data.accounts.length;
@@ -205,6 +266,21 @@ export function removeUpstream(id) {
   const rules = { ...(store.data.settings.rotationRules || {}) };
   delete rules[id];
   store.data.settings.rotationRules = rules;
+  // 把指向它那些模型的设置也清掉：留着就是永远匹配不上的死数据，
+  // 而且以后有人重新建一个同名上游会莫名继承这些设置
+  const prefix = slugOf(gone?.name) + '/';
+  const s = store.data.settings;
+  if (Array.isArray(s.disabledModels)) s.disabledModels = s.disabledModels.filter((m) => !m.startsWith(prefix));
+  if (s.modelTierOverrides && typeof s.modelTierOverrides === 'object') {
+    for (const key of Object.keys(s.modelTierOverrides)) if (key.startsWith(prefix)) delete s.modelTierOverrides[key];
+  }
+  if (store.data.modelStatus && typeof store.data.modelStatus === 'object') {
+    for (const key of Object.keys(store.data.modelStatus)) if (key.startsWith(prefix)) delete store.data.modelStatus[key];
+  }
+  for (const k of store.data.keys || []) {
+    if (Array.isArray(k.models) && k.models.length) k.models = k.models.filter((m) => !m.startsWith(prefix));
+  }
+  resetCursor(id);
   store.saveNow();
   return { removedAccounts };
 }

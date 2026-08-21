@@ -475,6 +475,48 @@ eq('删完那些号也不在了', store.data.accounts.some((a) => a.provider ===
 eq('删完它的策略也清掉了', Object.hasOwn(store.data.settings.rotationRules || {}, myUp.id), false);
 store.data.upstreams = [];
 
+// ── 前缀撞车：名字不同但 slug 相同的上游必须被拦住 ──
+// 「My Relay」和「my-relay」会生成同一个模型前缀，两个都存在的话
+// upstreamForModel 只会命中先建的那个，后建的模型永远调不通且看不出原因
+store.data.upstreams = [];
+const u1 = addUpstream({ name: 'Acme Relay', format: 'chat', baseUrl: 'https://a1.example.com/v1', models: ['m'] });
+eq('slug 撞车（大小写/空格差异）被拒', (() => { try { addUpstream({ name: 'acme-relay', format: 'chat', baseUrl: 'https://a2.example.com/v1' }); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+eq('原名完全相同也被拒', (() => { try { addUpstream({ name: 'Acme Relay', format: 'chat', baseUrl: 'https://a3.example.com/v1' }); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+eq('和内置上游同名被拒', (() => { try { addUpstream({ name: 'opencode', format: 'chat', baseUrl: 'https://a4.example.com/v1' }); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+eq('freebuff 也不能占', (() => { try { addUpstream({ name: 'FreeBuff', format: 'chat', baseUrl: 'https://a5.example.com/v1' }); return 'no-throw'; } catch (e) { return e.statusCode; } })(), 400);
+
+// 改名要把指向老 id 的设置一起搬走
+store.data.settings.disabledModels = ['acme-relay/m'];
+store.data.settings.modelTierOverrides = { 'acme-relay/m': 'free' };
+store.data.modelStatus['acme-relay/m'] = { state: 'ok' };
+store.data.keys[0].models = ['acme-relay/m'];
+ups.updateUpstream(u1.id, { name: 'Beta Relay' });
+eq('改名后模型 id 跟着变', mdl.catalog().some((m) => m.id === 'beta-relay/m'), true);
+eq('改名后下架列表跟着搬', store.data.settings.disabledModels, ['beta-relay/m']);
+eq('改名后分类覆盖跟着搬', store.data.settings.modelTierOverrides, { 'beta-relay/m': 'free' });
+eq('改名后实测状态跟着搬', Object.hasOwn(store.data.modelStatus, 'beta-relay/m'), true);
+eq('改名后 key 白名单跟着搬', store.data.keys[0].models, ['beta-relay/m']);
+store.data.keys[0].models = [];
+
+// 停用的上游：模型不对外，但请求时要说清是"停用"而不是"不存在"
+ups.updateUpstream(u1.id, { enabled: false });
+eq('停用后 checkModelAccess 说的是已停用', mdl.checkModelAccess({ allowPaid: true, models: [] }, 'beta-relay/m').status, 503);
+eq('停用后不出现在 /v1/models（按前缀也拦住）', mdl.filterModelList({ allowPaid: true, models: [] }, [{ id: 'beta-relay/m' }]).length, 0);
+eq('停用后不进目录', mdl.catalog().some((m) => m.id === 'beta-relay/m'), false);
+
+// 删上游要把设置里的死数据一起清掉
+ups.updateUpstream(u1.id, { enabled: true });
+store.data.settings.disabledModels = ['beta-relay/m', 'mimo/mimo-v2.5'];
+store.data.settings.modelTierOverrides = { 'beta-relay/m': 'free' };
+store.data.modelStatus['beta-relay/m'] = { state: 'ok' };
+removeUpstream(u1.id);
+eq('删上游清掉它的下架条目，别的不动', store.data.settings.disabledModels, ['mimo/mimo-v2.5']);
+eq('删上游清掉它的分类覆盖', Object.hasOwn(store.data.settings.modelTierOverrides, 'beta-relay/m'), false);
+eq('删上游清掉它的实测状态', Object.hasOwn(store.data.modelStatus, 'beta-relay/m'), false);
+store.data.upstreams = [];
+store.data.settings.disabledModels = [];
+store.data.settings.modelTierOverrides = {};
+
 // ─────────────────────────── 协议适配器注册表
 const proto = await import('../src/protocols/index.js');
 eq('四种格式都有适配器', ['chat', 'responses', 'anthropic', 'gemini'].map((f) => proto.knownFormat(f)), [true, true, true, true]);
