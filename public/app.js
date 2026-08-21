@@ -1180,9 +1180,9 @@ function renderSettings(s) {
   const rotations = s.providers?.rotations || {};
   $('#rot-overview').innerHTML = (s.providers?.list || [])
     .map(
-      (u) => `<div class="wire"><span class="wl">${esc(u.name)}</span>
-      <code>${esc(rotations[u.rotation.mode] || u.rotation.mode)}</code>
-      <span class="muted small">${u.accountsEnabled}/${u.accounts} 号</span></div>`
+      (u) => `<div class="rr"><span class="rr-name" title="${esc(u.name)}">${esc(u.name)}</span>
+      <span class="rr-mode">${esc(rotations[u.rotation.mode] || u.rotation.mode)}</span>
+      <span class="rr-keys">${u.accountsEnabled}/${u.accounts}</span></div>`
     )
     .join('');
   const sel = $('#set-active');
@@ -1206,8 +1206,8 @@ function renderSettings(s) {
     : '当前没有上游用单号策略，这个下拉只作为各上游的起点提示。';
 
   $('#set-allowpaid').checked = Boolean(s.settings.allowPaidDefault);
-  $('#s-datadir').textContent = s.storage.dir;
-  $('#s-persist').textContent = s.storage.persistent ? '持久' : '临时（重新部署会清空）';
+  // 目录和持久性挤在一行：持久性是这个目录的属性，分成两行反而要来回看
+  $('#s-datadir').textContent = `${s.storage.dir}　${s.storage.persistent ? '持久' : '临时 · 重新部署会清空'}`;
   $('#s-persist-note').textContent = s.storage.volume
     ? `Railway Volume 已挂载在 ${s.storage.volume}。`
     : s.storage.onRailway
@@ -1221,9 +1221,11 @@ function renderSettings(s) {
   const chat = s.chatlog || {};
   $('#set-chatlog').checked = Boolean(chat.enabled);
   $('#s-chat-size').textContent = chat.files
-    ? `${fmtBytes(chat.bytes)} · ${chat.files} 个文件${chat.full ? '（已写满，已停止记录）' : ''}`
+    ? `${fmtBytes(chat.bytes)} · ${chat.files} 个文件${chat.full ? ' · 已写满，停止记录' : ''}`
     : '还没有记录';
-  $('#s-chat-limit').textContent = `${fmtBytes(chat.limitBytes || 0)}（写满就停，不会自动删旧的）`;
+  $('#s-chat-limit').textContent = fmtBytes(chat.limitBytes || 0);
+  // 分组标题右边那句状态：开着还是关着，一眼看见
+  $('#s-chat-state').textContent = chat.enabled ? '正在记录' : '已关闭';
 
   const cred = s.credentials || {};
   const parts = [];
@@ -1997,9 +1999,9 @@ async function loadStorage() {
   try {
     const info = await api('/storage');
     const st = info.storage;
-    $('#s-store-total').textContent = `${fmtBytes(st.totalBytes)}${st.persistent ? '' : '（非持久）'}`;
+    $('#s-store-total').textContent = fmtBytes(st.totalBytes);
     $('#s-disk').textContent = st.disk
-      ? `${fmtBytes(st.disk.freeBytes)} 可用 / 共 ${fmtBytes(st.disk.totalBytes)}`
+      ? `磁盘剩余 ${fmtBytes(st.disk.freeBytes)} / 共 ${fmtBytes(st.disk.totalBytes)}`
       : '这个平台读不到磁盘信息';
     $('#s-store-items').innerHTML = st.items
       .map((i) => `<div><span>${esc(i.label)}</span><b>${fmtBytes(i.bytes)}</b></div>`)

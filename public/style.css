@@ -78,6 +78,7 @@ a:hover { text-decoration: underline; }
   font-size: 9.5px;
 }
 .eyebrow .eyebrow-note { margin-left: auto; color: var(--muted); letter-spacing: 0; font-size: 11px; }
+.eyebrow .eyebrow-note b { font-family: var(--mono); font-weight: 400; color: var(--text); }
 .view > .eyebrow:first-child { margin-top: 4px; }
 
 .panel-title {
@@ -357,6 +358,80 @@ a:hover { text-decoration: underline; }
 .split > .panel { display: flex; flex-direction: column; }
 .split > .panel > .btnrow:last-child { margin-top: auto; padding-top: 12px; }
 .wires { display: flex; flex-direction: column; }
+
+/* ══ 设置页：一串对齐的行，不是一堆方盒子 ══
+   左列等宽标签 / 中列控件+说明 / 右列动作。三列 grid 让整页的标签和按钮
+   都在同一条竖线上 —— 方盒子网格做不到这个，而且底边总是参差不齐。 */
+.setgroup { margin-bottom: 4px; }
+.setlist {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.setrow {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr) auto;
+  gap: 10px 18px;
+  align-items: start;
+  padding: 13px 16px;
+  border-top: 1px solid var(--edge);
+}
+.setrow:first-child { border-top: 0; }
+.setrow:hover { background: rgba(255, 255, 255, 0.012); }
+
+/* 左列：和 .wire 的 wl 同一套排版，整页竖直对齐 */
+.setrow > .sk {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+  padding-top: 4px;
+}
+.setrow > .sv { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.setrow > .sv > code { font-size: 12.5px; color: var(--text); word-break: break-all; }
+.setrow > .sv > select { max-width: 340px; }
+.setrow > .sa { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+
+/* 说明文字：跟着控件走，不要额外的上下外边距把行撑开 */
+.sh { margin: 0; font-size: 11.5px; line-height: 1.55; color: var(--muted-2); }
+.sh code { font-size: 11px; color: var(--muted); }
+
+/* 开关和它的文字排一行，比 row-toggle 那种两端对齐更紧凑 */
+.inline-toggle { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+.inline-toggle span { font-size: 13px; }
+.btnrow.flat { margin-top: 0; }
+
+/* 换号策略总览：塞在一个 setrow 里，自己是个小两列表 */
+#rot-overview { display: grid; grid-template-columns: 1fr; gap: 0; grid-column: 1 / -1; }
+#rot-overview .rr {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr) auto;
+  gap: 18px;
+  padding: 5px 0;
+  align-items: baseline;
+}
+#rot-overview .rr + .rr { border-top: 1px dashed var(--edge); }
+#rot-overview .rr-name {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#rot-overview .rr-mode { font-size: 12.5px; color: var(--text); }
+#rot-overview .rr-keys { font-family: var(--mono); font-size: 11px; color: var(--muted-2); }
+
+@media (max-width: 720px) {
+  .setrow { grid-template-columns: 1fr; }
+  .setrow > .sk { padding-top: 0; }
+  /* 策略总览那几行本来就短，窄屏也保持一行：名字 + 策略 + 号数 */
+  #rot-overview .rr { grid-template-columns: minmax(0, 1fr) auto; row-gap: 2px; }
+  #rot-overview .rr-name { grid-column: 1 / -1; }
+}
 
 /* ── 选上游（添加账号的第一步）── */
 .picks { display: flex; flex-direction: column; gap: 8px; }
@@ -814,10 +889,18 @@ dialog::backdrop { background: rgba(4, 8, 9, 0.72); backdrop-filter: blur(3px); 
   padding: 10px 14px 0;
 }
 
-.storelist { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
-.storelist div { display: flex; gap: 8px; font-size: 12px; }
-.storelist span:first-child { flex: 1; color: var(--muted); }
-.storelist b { font-family: var(--mono); font-weight: 400; }
+/* 存储明细：缩进到值列里，用竖线挂在总数下面，别看着像另一块内容 */
+.storelist {
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-left: 11px;
+  border-left: 1px solid var(--edge);
+}
+.storelist div { display: flex; gap: 8px; font-size: 11.5px; }
+.storelist span:first-child { flex: 1; color: var(--muted-2); }
+.storelist b { font-family: var(--mono); font-weight: 400; color: var(--muted); }
 
 /* ── 提示条 ── */
 .toasts { position: fixed; right: 16px; bottom: 16px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: min(420px, calc(100vw - 32px)); }
