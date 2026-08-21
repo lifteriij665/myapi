@@ -11,7 +11,7 @@
 // 补上这组头之后同一个请求就是 200。参考实现 jasonxu114514/opencode2api 也是这么做的。
 import { createHash, randomBytes } from 'node:crypto';
 import { config } from './config.js';
-import { nativeProtocol } from './models-opencode.js';
+import { nativeProtocol, stripPrefix } from './models-opencode.js';
 
 // 官方 CLI 在没配 key 时用的公共凭据。上游把它当匿名请求，按出口 IP 给免费模型限流。
 export const ANON_KEY = 'public';
@@ -96,19 +96,46 @@ export function upstreamHeaders(req, body, token) {
  * `Input required: specify "prompt" or "messages"`。
  * body 的格式转换由 engine 那边负责（src/anthropic-bridge.js）。
  */
-export function upstreamPath(pathname, modelId) {
+export function upstreamPath(pathname, modelId, stream = false) {
   if (/\/models$/.test(pathname)) return '/models';
-  return nativeProtocol(modelId) === 'anthropic' ? '/messages' : '/chat/completions';
+  const p = nativeProtocol(modelId);
+  if (p === 'anthropic') return '/messages';
+  if (p === 'responses') return '/responses';
+  // Gemini 是按模型拼路径的，流式还要换成 streamGenerateContent
+  if (p === 'google') {
+    const bare = stripPrefix(modelId || '');
+    return stream ? `/models/${bare}:streamGenerateContent?alt=sse` : `/models/${bare}:generateContent`;
+  }
+  return '/chat/completions';
+}
+
+/**
+ * Zen 的鉴权头也跟着协议走：Gemini 端点读 x-goog-api-key，
+ * Anthropic 端点读 x-api-key，其余读 Authorization。
+ * 三个都带上最省事，上游只认它需要的那个。
+ */
+function protocolAuthHeaders(token, modelId) {
+  const key = token || ANON_KEY;
+  if (nativeProtocol(modelId) === 'google') return { 'x-goog-api-key': key };
+  return {};
 }
 
 /** 一次上游调用；返回原生 WHATWG Response，好让上层的流式/头部处理完全复用 */
 export async function callOpencode({ pathname, method = 'POST', body, req, token, signal, modelId }) {
-  const url = config.opencodeBase + upstreamPath(pathname, modelId || body?.model);
-  const headers = upstreamHeaders(req, body, token);
+  const stream = Boolean(body?.stream) || Boolean(body?.generationConfig && body?.__stream);
+  const url = config.opencodeBase + upstreamPath(pathname, modelId || body?.model, stream);
+  const headers = { ...upstreamHeaders(req, body, token), ...protocolAuthHeaders(token, modelId || body?.model) };
+  // Gemini 的 body 里不带 model（在路径上），也不认 stream 字段
+  const payload = { ...(body ?? {}) };
+  delete payload.__stream;
+  if (nativeProtocol(modelId || body?.model) === 'google') {
+    delete payload.model;
+    delete payload.stream;
+  }
   return fetch(url, {
     method,
     headers,
-    body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(body ?? {}),
+    body: method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(payload),
     signal,
     redirect: 'follow',
   });

@@ -585,24 +585,35 @@ async function dispatchApi(req, res, url) {
    *
    * 自定义上游则统一以 chat 为中枢：客户端说 Anthropic 就先翻成 chat（a2c），
    * 再由 src/protocols 的适配器翻成那个上游要的格式。所以四种协议两两组合
-   * 都不用单独写代码。
+   * 都不用单独写代码。opencode 的 gpt-* / gemini-* 也走这套适配器。
    */
   const customUp = requestedModel ? upstreamForModel(requestedModel) : null;
+  // opencode 上这个模型的原生协议（chat / anthropic / responses / google）
+  const ocNative = requestedModel && isOpencodeModel(requestedModel) ? nativeProtocol(requestedModel) : null;
   let bridge = null;
-  if (requestedModel && isOpencodeModel(requestedModel)) {
-    const native = nativeProtocol(requestedModel);
-    if (isAnthropic && native !== 'anthropic') bridge = 'a2c';
-    else if (!isAnthropic && native === 'anthropic') bridge = 'c2a';
+  if (ocNative) {
+    if (isAnthropic && ocNative !== 'anthropic') bridge = 'a2c';
+    else if (!isAnthropic && ocNative === 'anthropic') bridge = 'c2a';
   } else if (customUp && isAnthropic) {
     // 客户端发的是 Anthropic，内部一律先归一到 chat
     bridge = 'a2c';
   }
+  // responses / google 这两种没有直接的 chat↔它 的桥，统一走 protocols 适配器：
+  // 先把请求归一成 chat，再由适配器翻过去（回来的响应同理）
+  const ocAdapter = ocNative === 'responses' || ocNative === 'google' ? adapterFor(ocNative) : null;
   const callUpstream = (acct) => {
     const prov = providerOf(acct);
     if (prov === 'freebuff') return worker.fetch(makeRequest(), buildEnv([acct.token], presented));
     if (prov === 'opencode') {
       // 发给 Zen 的模型名不能带我们自己的 opencode/ 前缀
       const bare = stripPrefix(requestedModel || parsed?.model || '');
+      if (ocAdapter) {
+        const chatBody = isAnthropic ? anthropicToChat(parsed || {}, bare) : { ...(parsed || {}), model: bare };
+        const body = ocAdapter.requestFromChat(chatBody, bare);
+        // Gemini 的 stream 标记在路径上不在 body 里，单独带过去
+        if (chatBody.stream) body.__stream = true;
+        return callOpencode({ pathname, method: req.method, body, req, token: acct.token, modelId: bare });
+      }
       const body =
         bridge === 'a2c'
           ? anthropicToChat(parsed || {}, bare)
@@ -792,10 +803,12 @@ async function dispatchApi(req, res, url) {
       payload = JSON.parse(text);
     } catch {}
     const ok = response.status < 400;
-    // 自定义上游先归一到中枢格式：后面的 usage 统计、聊天记录、协议回翻
-    // 全都按 chat 的字段读，翻早一点这些就都不用再分情况
+    // 自定义上游 / opencode 的非 chat 原生模型，先归一到中枢格式：后面的 usage
+    // 统计、聊天记录、协议回翻全都按 chat 的字段读，翻早一点这些就都不用再分情况
     if (payload && ok && customUp && providerOf(used) === customUp.id) {
       payload = adapterFor(customUp.format).responseToChat(payload, requestedModel);
+    } else if (payload && ok && ocAdapter && providerOf(used) === 'opencode') {
+      payload = ocAdapter.responseToChat(payload, requestedModel);
     }
     const usageInfo = payload ? usageFromJson(payload) : null;
     recordModelResult(requestedModel, { ok, status: response.status, text: ok ? '' : text });
@@ -837,7 +850,11 @@ async function dispatchApi(req, res, url) {
   //   patcher  中枢流 → 客户端要的协议
   // 串起来正好覆盖"任意上游协议 × 任意客户端协议"，不用为每种组合单独写。
   const inbound =
-    customUp && providerOf(used) === customUp.id ? adapterFor(customUp.format).createStreamToChat(requestedModel) : null;
+    customUp && providerOf(used) === customUp.id
+      ? adapterFor(customUp.format).createStreamToChat(requestedModel)
+      : ocAdapter && providerOf(used) === 'opencode'
+        ? ocAdapter.createStreamToChat(requestedModel)
+        : null;
   const patcher =
     bridge === 'a2c'
       ? createChatToAnthropicStream(requestedModel)

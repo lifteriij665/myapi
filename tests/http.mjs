@@ -249,27 +249,35 @@ const stillLoggedIn = await admin('/session');
 check('全部清理之后还能登录（密码保留）', stillLoggedIn.json?.authed === true, JSON.stringify(stillLoggedIn.json));
 
 
-// ── 上游暂停的模型（worker 1.8.10 的 PAUSED_MODELS）──
+// ── 引擎列表里缺席的模型：只提示，不拦 ──
+// 免费额度每天刷新、付费能解锁，上游自己都没拦，中转没资格更严。
+// 以前这里会直接回 404，用户明确指出这不合理。
 const st2 = await admin('/state');
 // 上面「全部清理」把 key 全删了并补了一个新的，module 级的 KEY 已经作废
 KEY = st2.json.keys[0].key;
-const paused = st2.json.models.filter((m) => m.availability?.state === 'paused').map((m) => m.id);
-check('能识别出引擎屏蔽的模型', paused.length > 0, `paused=${JSON.stringify(paused)}`);
+const absent = st2.json.models.filter((m) => m.availability?.state === 'absent').map((m) => m.id);
+check('能识别出引擎列表里缺席的模型', absent.length > 0, `absent=${JSON.stringify(absent)}`);
+check(
+  '缺席的说明里讲的是额度/付费，不是"被暂停"',
+  st2.json.models.filter((m) => m.availability?.state === 'absent').every((m) => /额度|付费|升级/.test(m.availability.detail || '')),
+  JSON.stringify(st2.json.models.find((m) => m.availability?.state === 'absent')?.availability)
+);
 const liveResp = await (await raw('/v1/models', { headers: { authorization: `Bearer ${KEY}` } })).json();
 const liveIds = (liveResp?.data || []).map((m) => m.id);
-check(
-  '被暂停的模型不出现在 /v1/models',
-  liveIds.length > 0 && paused.every((id) => !liveIds.includes(id)),
-  JSON.stringify(liveResp).slice(0, 200)
-);
-const pausedReq = await raw('/v1/chat/completions', {
+check('缺席的模型照样出现在 /v1/models（免费那些）', liveIds.length > 0, JSON.stringify(liveResp).slice(0, 200));
+// 真发一次：可以失败（号是假的），但**不能是我们自己拦的 404**
+const absentReq = await raw('/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-  body: JSON.stringify({ model: paused[0], messages: [{ role: 'user', content: 'x' }] }),
+  body: JSON.stringify({ model: absent[0], messages: [{ role: 'user', content: 'x' }] }),
 });
-const pausedBody = await pausedReq.text();
-check('请求被暂停的模型给出明确原因', pausedReq.status === 404 && /暂停/.test(pausedBody), `${pausedReq.status} ${pausedBody.slice(0, 120)}`);
-check('默认模型不会是被暂停的那个', !paused.includes(st2.json.defaultModel), String(st2.json.defaultModel));
+const absentBody = await absentReq.text();
+check(
+  '请求缺席的模型不再被网关拦掉（转发给上游）',
+  absentReq.status !== 404 && !/暂停/.test(absentBody),
+  `${absentReq.status} ${absentBody.slice(0, 160)}`
+);
+check('默认模型仍然优先挑引擎列出来的', !absent.includes(st2.json.defaultModel), String(st2.json.defaultModel));
 check('引擎版本跟 vendor 一致', st2.json.workerVersion === '1.8.10', String(st2.json.workerVersion));
 
 // ── opencode Zen 号池 ──

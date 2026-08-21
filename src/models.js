@@ -22,8 +22,6 @@ import {
   OPENCODE_PREFIX,
   OPENCODE_REGION_LOCKED,
   defaultOpencodeModel,
-  isSupportedProtocol,
-  protocolNote,
   nativeProtocol,
 } from './models-opencode.js';
 import { fetchOpencodeModels } from './opencode.js';
@@ -406,20 +404,25 @@ export function learnFromQuotaSnapshot(rateLimits, limitedOffers) {
 }
 
 /**
- * 引擎（vendor/worker.js）自己也有一份"上游已暂停"名单，1.8.10 起它会把那些模型
- * 从 /v1/models 里滤掉、请求时直接回 unsupported_model。
- * 这里不重复维护那份名单 —— 直接对比"我的表里有、引擎列表里没有"，
- * 这样以后 npm run update-worker 换了名单也自动跟上。
+ * 引擎（vendor/worker.js）当前的 /v1/models 列表里没有哪些模型。
+ *
+ * ⚠️ 这个集合**只用来在控制台上做提示**，绝不用来拦请求。原因：
+ *   * 免费额度每天会刷新，今天调不通的模型明天可能就通了；
+ *   * 付费 / 升级账号能解锁的模型，在免费号的列表里本来就不出现；
+ *   * 引擎自己的硬编码暂停名单只有一两个模型，"不在列表里"的原因远不止暂停
+ *     （动态表没拉到、只返回了兜底列表、上游临时抖动都会让它变短）。
+ * 中转的职责是转发，可用与否由上游说。以前这里会直接回 404，等于比上游还严 ——
+ * 那是错的，已经改成照常转发。
  */
 const enginePaused = new Set();
 
 export function noteEngineModelList(liveIds) {
-  // 引擎拉不到动态表时只剩一个硬编码兜底模型，那种列表不能用来判断"被暂停"
+  // 引擎拉不到动态表时只剩一个硬编码兜底模型，那种列表不能用来判断"缺席"
   if (!Array.isArray(liveIds) || liveIds.length < 3) return enginePaused;
   const live = new Set(liveIds);
   enginePaused.clear();
-  // 只对 freebuff 的模型做这个判断：opencode 的模型根本不经过 vendor/worker.js，
-  // 拿引擎列表去比会把它们全判成"已暂停"
+  // 只对 freebuff 的模型做这个判断：opencode 和自定义上游的模型根本不经过
+  // vendor/worker.js，拿引擎列表去比会把它们全判成缺席
   for (const id of table.models.keys()) if (!live.has(id)) enginePaused.add(id);
   return enginePaused;
 }
@@ -432,20 +435,21 @@ export function availabilityOf(modelId) {
   if (isOpencodeModel(modelId)) {
     const entry = opencodeEntry(modelId);
     if (!entry) return { state: 'unverified', detail: '不在 opencode Zen 当前的模型列表里', at: null };
-    if (entry.supported === false) {
-      return { state: 'protocol_unsupported', detail: protocolNote(modelId), at: null };
-    }
     if (entry.regionLocked) {
-      return { state: 'region_locked', detail: '上游按地区限制：当前机房请求会回 403 RegionError', at: null };
+      return { state: 'region_locked', detail: '上游按地区限制：当前机房请求可能回 403 RegionError', at: null };
     }
     const st = store.modelStatus?.[modelId];
     if (st) return { state: st.state || 'unverified', detail: st.detail || '', at: st.at || null, fails: st.fails || 0 };
     return { state: 'listed', detail: 'opencode Zen 上游列表里有它（还没实测过）', at: null };
   }
+  // "引擎列表里没有它" 只作为提示，不代表不能用：额度每天刷新、付费能解锁，
+  // 所以照常放行，真调不通的时候上游会自己说
   if (enginePaused.has(modelId)) {
+    const st = store.modelStatus?.[modelId];
+    if (st?.state === 'ok') return { state: 'ok', detail: st.detail || '实测调用成功', at: st.at || null };
     return {
-      state: 'paused',
-      detail: '引擎按上游"已暂停"名单屏蔽了它：不会出现在 /v1/models，请求会直接被拒（vendor/worker.js 的 PAUSED_MODELS）',
+      state: 'absent',
+      detail: '当前引擎的 /v1/models 里没列出它（可能是免费额度已用完、或者要付费/升级才解锁）。仍然可以直接请求，能不能用由上游说。',
       at: null,
     };
   }
@@ -562,13 +566,6 @@ export function checkModelAccess(keyRecord, modelId) {
       };
     }
     if (disabled.has(modelId)) return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
-    if (!isSupportedProtocol(modelId)) {
-      return {
-        ok: false,
-        status: 404,
-        message: `模型 ${modelId} 走的是本网关还没实现的上游协议（${protocolNote(modelId)}）；GET /v1/models 是当前真正能用的列表`,
-      };
-    }
     if (keyRecord?.models?.length && !keyRecord.models.includes(modelId)) {
       return { ok: false, status: 403, message: `当前 API key 未授权模型 ${modelId}` };
     }
@@ -603,13 +600,9 @@ export function checkModelAccess(keyRecord, modelId) {
   if (idle) {
     return { ok: false, status: 503, message: `上游「${idle.name}」已停用，去控制台重新启用或换一个模型` };
   }
-  if (modelId && enginePaused.has(modelId)) {
-    return {
-      ok: false,
-      status: 404,
-      message: `模型 ${modelId} 已被上游暂停提供（引擎 vendor/worker.js 的 PAUSED_MODELS 里有它），换一个模型；GET /v1/models 是当前真正能用的列表`,
-    };
-  }
+  // 注意：这里**不再**因为"引擎的模型列表里没有它"就拦掉。
+  // 额度每天刷新、付费能解锁，上游自己都没拦，中转没有资格比上游更严。
+  // 真的不可用时，上游会回它自己的错误，那条错误比我们猜的准。
   if (modelId && disabled.has(modelId)) {
     return { ok: false, status: 403, message: `模型 ${modelId} 已在控制台被下架` };
   }
@@ -672,8 +665,7 @@ export function filterModelList(keyRecord, list) {
     if (allow && !allow.has(id)) return false;
     if (!keyRecord?.allowPaid && tierOf(id) === 'paid') return false;
     if (isOpencodeModel(id)) {
-      if (!isSupportedProtocol(id)) return false; // 协议没实现，列出来只会让客户端拿到必然 400 的 id
-      // 地区挡掉的模型对这个部署来说就是调不通，别塞给客户端
+      // 地区挡掉的模型对这个部署来说确实调不通（403 RegionError），这个才是硬事实
       if (hideDead && OPENCODE_REGION_LOCKED.has(stripPrefix(id))) return false;
       return hasOpencodeModel(id);
     }
@@ -683,11 +675,10 @@ export function filterModelList(keyRecord, list) {
       if (hideDead && availabilityOf(id).state === 'unavailable') return false;
       return true;
     }
-    // 前缀属于某个停用上游 → 不对外提供
+    // 前缀属于某个停用上游 → 不对外提供（这是用户自己在控制台关的）
     if (idleUpstreamFor(id)) return false;
-    // 实测过、确认上游按模型本身拒绝的，默认不再对外提供 ——
-    // 客户端拿到一份"里面有一半调不通"的模型列表毫无用处
-    if (enginePaused.has(id)) return false;
+    // 注意：**不再**因为"引擎列表里没有它"就藏掉。额度每天刷新、付费能解锁，
+    // 藏掉等于替用户做决定。只有连续实测失败（unavailable）才藏，且可在设置里关。
     if (hideDead && availabilityOf(id).state === 'unavailable') return false;
     return true;
   });

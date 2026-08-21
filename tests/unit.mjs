@@ -201,7 +201,7 @@ eq('免费模型都是 chat 原生', ['mimo-v2.5-free', 'big-pickle', 'deepseek-
 eq('claude / qwen 是 Anthropic 原生', [nativeProtocol('claude-sonnet-5'), nativeProtocol('qwen3.6-plus')], ['anthropic', 'anthropic']);
 eq('gpt / grok / muse 是 Responses 原生', ['gpt-5', 'grok-4.6', 'muse-spark-1.2'].map(nativeProtocol), ['responses', 'responses', 'responses']);
 eq('gemini 是 Google 原生', nativeProtocol('gemini-3-flash'), 'google');
-eq('只承接 chat 和 anthropic 两种', ['mimo-v2.5-free', 'claude-sonnet-5', 'gpt-5', 'gemini-3-flash'].map(isSupportedProtocol), [true, true, false, false]);
+eq('四种协议现在都能承接（gpt / gemini 也有适配器了）', ['mimo-v2.5-free', 'claude-sonnet-5', 'gpt-5', 'gemini-3-flash'].map(isSupportedProtocol), [true, true, true, true]);
 
 // a2c：Anthropic 请求 → chat 请求
 const a2cReq = bridge.anthropicToChat(
@@ -534,6 +534,40 @@ eq('上游失败归类：429 → 限流', proto.classifyUpstreamFailure(429, 'to
 eq('上游失败归类：403 + 地区字样 → 地区受限', proto.classifyUpstreamFailure(403, 'unsupported_country_region'), 'country_blocked');
 eq('上游失败归类：402 → 余额不足', proto.classifyUpstreamFailure(402, ''), 'no_credit');
 eq('上游失败归类：500 → 上游失败', proto.classifyUpstreamFailure(500, 'oops'), 'upstream_error');
+
+// ─────────────────────────── 中转不许比上游更严
+// 额度每天刷新、付费能解锁，所以"引擎的 /v1/models 里没有它"绝不能成为拦请求的理由。
+// 以前这里会直接回 404，用户明确指出这不合理。
+const { noteEngineModelList, isEnginePaused, availabilityOf } = mdl;
+// 造一个"引擎只列出两个模型"的场景：flash 不在列表里
+noteEngineModelList(['mimo/mimo-v2.5', 'z-ai/glm-5.2', 'crof/kimi-k3-eco']);
+eq('缺席集合里确实有 flash', isEnginePaused('deepseek/deepseek-v4-flash'), true);
+eq('缺席的模型仍然放行（不再 404）', mdl.checkModelAccess({ allowPaid: true, models: [] }, 'deepseek/deepseek-v4-flash').ok, true);
+eq('缺席状态叫 absent 而不是 paused', availabilityOf('deepseek/deepseek-v4-flash').state, 'absent');
+eq('缺席的模型照样列进 /v1/models', mdl.filterModelList({ allowPaid: true, models: [] }, [{ id: 'deepseek/deepseek-v4-flash' }]).length, 1);
+eq(
+  '缺席说明里讲清是额度或付费问题，不是"被暂停"',
+  /额度|付费|升级/.test(availabilityOf('deepseek/deepseek-v4-flash').detail),
+  true
+);
+// 实测成功过的模型，即使不在引擎列表里也该显示可用
+store.data.modelStatus['deepseek/deepseek-v4-flash'] = { state: 'ok', detail: '实测调用成功' };
+eq('实测通过的优先显示 ok', availabilityOf('deepseek/deepseek-v4-flash').state, 'ok');
+delete store.data.modelStatus['deepseek/deepseek-v4-flash'];
+// 控制台手动下架仍然要拦（那是用户自己的决定，不是我们替他猜的）
+store.data.settings.disabledModels = ['deepseek/deepseek-v4-flash'];
+eq('手动下架照样拦（用户自己的决定）', mdl.checkModelAccess({ allowPaid: true, models: [] }, 'deepseek/deepseek-v4-flash').status, 403);
+store.data.settings.disabledModels = [];
+// opencode 的 gpt-* / gemini-* 现在有适配器了，不该再被拒
+// （单测里没联网，opencode 表只有静态的免费名单，所以这里只验门禁不验列表）
+eq('opencode 的 gpt-* 不再被拒', mdl.checkModelAccess({ allowPaid: true, models: [] }, 'opencode/gpt-5-nano').ok, true);
+eq('opencode 的 gemini-* 不再被拒', mdl.checkModelAccess({ allowPaid: true, models: [] }, 'opencode/gemini-3-flash').ok, true);
+eq(
+  'opencode 免费模型照常进 /v1/models',
+  mdl.filterModelList({ allowPaid: true, models: [] }, [{ id: 'opencode/mimo-v2.5-free' }, { id: 'opencode/big-pickle' }]).length,
+  2
+);
+noteEngineModelList([]); // 复位，别影响后面的断言
 
 console.log(`\n单元测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

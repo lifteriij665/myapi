@@ -71,20 +71,17 @@ export function nativeProtocol(modelId) {
 
 /**
  * 本网关能不能承接这个模型。
- * 只支持 chat 和 anthropic 两种原生协议 —— 这两个正好覆盖全部免费模型（除了
- * muse-spark 那个 responses 原生 + 地区受限的）和全部 Claude / Qwen。
- * OpenAI Responses 和 Google generateContent 是另外两套 body 格式，
- * 没实现就别把模型列出去，免得客户端拿到一个必然 400 的 id。
+ * 四种协议现在都有适配器（src/protocols/），所以全都能接 ——
+ * 早期只实现了 chat 和 anthropic，那时候会把 gpt-* / gemini-* 直接拒掉。
+ * 保留这个函数是因为调用点不少，而且以后真出现第五种协议时还用得上。
  */
 export function isSupportedProtocol(modelId) {
   const p = nativeProtocol(modelId);
-  return p === 'chat' || p === 'anthropic';
+  return p === 'chat' || p === 'anthropic' || p === 'responses' || p === 'google';
 }
 
 export function protocolNote(modelId) {
-  const p = nativeProtocol(modelId);
-  if (p === 'responses') return '上游原生协议是 OpenAI Responses（/v1/responses），本网关还没实现这套 body 格式';
-  if (p === 'google') return '上游原生协议是 Google generateContent，本网关还没实现这套 body 格式';
+  void modelId;
   return '';
 }
 
@@ -121,8 +118,6 @@ export function opencodeDisplayName(modelId) {
 
 export function opencodeNote(modelId) {
   const bare = stripPrefix(modelId);
-  const proto = protocolNote(bare);
-  if (proto) return `opencode Zen：${proto}，所以暂时不对外提供`;
   if (OPENCODE_REGION_LOCKED.has(bare)) {
     return `opencode Zen 免费模型；上游按地区限制，当前机房可能回 403（${RETENTION[bare] || ''}）`;
   }

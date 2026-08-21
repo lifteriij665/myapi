@@ -1052,8 +1052,9 @@ function renderKeys(s) {
 
 let modelFilter = 'all';
 
-// 「不可用」这一档：真的调不通的都算进来，不然过滤器会漏掉协议没实现和地区受限的
-const DEAD_STATES = ['unavailable', 'paused', 'protocol_unsupported', 'region_locked'];
+// 「有问题」这一档：只放**确实调不通**的。
+// "引擎列表里没有它"（absent）不算 —— 额度每天刷新、付费能解锁，那只是个提示。
+const DEAD_STATES = ['unavailable', 'region_locked'];
 
 const AVAIL_LABEL = {
   ok: ['ok', '实测可用'],
@@ -1061,8 +1062,7 @@ const AVAIL_LABEL = {
   listed: ['ok', '在上游列表里'],
   suspect: ['warn', '失败过一次'],
   unavailable: ['bad', '实测不可用'],
-  paused: ['bad', '上游已暂停'],
-  protocol_unsupported: ['bad', '协议未实现'],
+  absent: ['warn', '未列出 · 仍可试'],
   region_locked: ['warn', '当前地区不可用'],
   unverified: ['', '未验证'],
 };
