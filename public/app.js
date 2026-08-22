@@ -2007,8 +2007,17 @@ async function loadStorage() {
     $('#s-disk').textContent = st.disk
       ? `磁盘剩余 ${fmtBytes(st.disk.freeBytes)} / 共 ${fmtBytes(st.disk.totalBytes)}`
       : '这个平台读不到磁盘信息';
+    // 各类占用画成占比条：一列数字看不出谁大谁小，横条一眼就分得出
+    const total = st.items.reduce((n, i) => n + (i.bytes || 0), 0);
     $('#s-store-items').innerHTML = st.items
-      .map((i) => `<div><span>${esc(i.label)}</span><b>${fmtBytes(i.bytes)}</b></div>`)
+      .map((i) => {
+        const pct = total > 0 ? (i.bytes || 0) / total : 0;
+        return `<div class="si${i.bytes ? '' : ' is-zero'}">
+        <span class="si-label">${esc(i.label)}</span>
+        <span class="si-bar"><i style="width:${(pct * 100).toFixed(1)}%"></i></span>
+        <b>${fmtBytes(i.bytes)}</b>
+      </div>`;
+      })
       .join('');
   } catch (err) {
     $('#s-store-total').textContent = `读取失败：${err.message}`;

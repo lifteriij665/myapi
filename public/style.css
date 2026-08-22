@@ -1,6 +1,12 @@
 /* ═══════════════════════════════════════════════════════════════
    myapi 控制台 —— 配电盘（patch bay）风格：深青黑底 + 等宽字排版
    语义色只有两个：signal(免费/健康) 和 meter(付费/要烧额度)
+
+   排版取向（照着几份现代 landing page 的做法收敛过来的）：
+     * 一个强调色就够，其余全靠灰阶分层 —— 不堆渐变、不堆装饰块
+     * 标题用衬线体做一个"重音"，正文仍是无衬线，对比出层次
+     * 竖向留白给足：区块之间用空间分组，而不是靠画更多边框
+     * 边框只做最轻的分隔，重的活交给背景色差
    ═══════════════════════════════════════════════════════════════ */
 :root {
   --ink: #0b1113;
@@ -21,6 +27,8 @@
   --link: #7fb4e8;
   --mono: ui-monospace, "SFMono-Regular", "SF Mono", "Cascadia Mono", "JetBrains Mono", "Roboto Mono", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 标题的衬线重音。中文回落到宋体一族，英文数字走 Georgia 那条线 */
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Songti SC", "Source Han Serif SC", "Noto Serif CJK SC", serif;
   --rail: 216px;
   --r: 10px;
 }
@@ -58,6 +66,8 @@ a:hover { text-decoration: underline; }
 }
 
 /* ── 排版：等宽做标题/标签，无衬线做正文 ── */
+/* 区块标题：小字号 + 宽字距的 eyebrow，靠上方的大留白和下方的细线分组。
+   留白比边框更能说明"这是新的一段" */
 .eyebrow {
   display: flex;
   align-items: baseline;
@@ -67,8 +77,8 @@ a:hover { text-decoration: underline; }
   font-size: 11px;
   letter-spacing: 0.02em;
   color: var(--text);
-  margin: 26px 0 11px;
-  padding-bottom: 7px;
+  margin: 38px 0 13px;
+  padding-bottom: 8px;
   border-bottom: 1px solid var(--edge);
 }
 .eyebrow b { font-weight: 600; white-space: nowrap; font-family: var(--sans); font-size: 12.5px; }
@@ -96,14 +106,23 @@ a:hover { text-decoration: underline; }
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 18px 0 14px;
+  padding: 26px 0 18px;
   position: sticky;
   top: 0;
   z-index: 20;
   background: linear-gradient(180deg, var(--ink) 72%, rgba(11, 17, 19, 0.86));
   backdrop-filter: blur(4px);
 }
-.topbar h1 { font-size: 17px; margin: 0; letter-spacing: 0.01em; font-weight: 600; }
+/* 页标题：衬线体 + 大一号，给每个视图一个明确的开场。
+   这是整页唯一的"大字"，其余都收在 13px 以下 —— 层次靠这一处对比拉开 */
+.topbar h1 {
+  font-family: var(--serif);
+  font-size: 25px;
+  line-height: 1.15;
+  margin: 0;
+  letter-spacing: -0.015em;
+  font-weight: 400;
+}
 .synced { font-family: var(--mono); font-size: 10.5px; color: var(--muted-2); }
 
 .pill {
@@ -362,7 +381,9 @@ a:hover { text-decoration: underline; }
 /* ══ 设置页：一串对齐的行，不是一堆方盒子 ══
    左列等宽标签 / 中列控件+说明 / 右列动作。三列 grid 让整页的标签和按钮
    都在同一条竖线上 —— 方盒子网格做不到这个，而且底边总是参差不齐。 */
-.setgroup { margin-bottom: 4px; }
+/* 设置页那几组：组间留白比组内大得多，一眼能看出分了几段 */
+.setgroup { margin-bottom: 6px; }
+.setgroup + .setgroup { margin-top: 4px; }
 .setlist {
   background: var(--panel);
   border: 1px solid var(--edge);
@@ -372,10 +393,11 @@ a:hover { text-decoration: underline; }
 .setrow {
   display: grid;
   grid-template-columns: 116px minmax(0, 1fr) auto;
-  gap: 10px 18px;
+  gap: 10px 20px;
   align-items: start;
-  padding: 13px 16px;
-  border-top: 1px solid var(--edge);
+  padding: 16px 18px;
+  /* 内部分隔用比外框更淡的线：外框负责"这是一组"，内线只负责"这是一行" */
+  border-top: 1px solid rgba(255, 255, 255, 0.045);
 }
 .setrow:first-child { border-top: 0; }
 .setrow:hover { background: rgba(255, 255, 255, 0.012); }
@@ -894,13 +916,40 @@ dialog::backdrop { background: rgba(4, 8, 9, 0.72); backdrop-filter: blur(3px); 
   margin-top: 2px;
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding-left: 11px;
-  border-left: 1px solid var(--edge);
+  gap: 5px;
 }
-.storelist div { display: flex; gap: 8px; font-size: 11.5px; }
-.storelist span:first-child { flex: 1; color: var(--muted-2); }
-.storelist b { font-family: var(--mono); font-weight: 400; color: var(--muted); }
+/* 三列：类别 / 占比条 / 字节数。条子让"谁占得多"不用读数字就看得出来。
+   条子给个上限宽度 —— 铺满整行反而显得空，而且把标签挤没了 */
+.storelist .si {
+  display: grid;
+  grid-template-columns: minmax(0, 210px) minmax(60px, 200px) 62px;
+  align-items: center;
+  gap: 12px;
+  font-size: 11.5px;
+}
+.storelist .si-label {
+  color: var(--muted-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.storelist .si-bar {
+  height: 4px;
+  background: var(--ink-2);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.storelist .si-bar i { display: block; height: 100%; background: var(--meter); }
+.storelist b { font-family: var(--mono); font-weight: 400; color: var(--muted); text-align: right; }
+.storelist .si.is-zero .si-bar { opacity: 0.4; }
+.storelist .si.is-zero b { color: var(--muted-2); }
+
+@media (max-width: 720px) {
+  .storelist .si { grid-template-columns: minmax(0, 1fr) 62px; }
+  .storelist .si-bar { grid-column: 1 / -1; }
+}
 
 /* ── 提示条 ── */
 .toasts { position: fixed; right: 16px; bottom: 16px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: min(420px, calc(100vw - 32px)); }

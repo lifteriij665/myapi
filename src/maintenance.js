@@ -75,11 +75,11 @@ export function inspectStorage() {
   for (const t of temps) tempBytes += fileSize(t).bytes;
 
   const items = [
-    { key: 'core', label: '账号 / API key / 设置 / 密码', path: p.data, ...fileSize(p.data), keepIn: ['routine', 'deep'] },
-    { key: 'usage', label: '用量统计（请求数、token 数）', path: p.usage, ...fileSize(p.usage), keepIn: ['routine'] },
+    { key: 'core', label: '账号 / Key / 设置', path: p.data, ...fileSize(p.data), keepIn: ['routine', 'deep'] },
+    { key: 'usage', label: '用量统计', path: p.usage, ...fileSize(p.usage), keepIn: ['routine'] },
     { key: 'chatlog', label: '聊天记录', path: p.chatlog, ...dirSize(p.chatlog), keepIn: [] },
-    { key: 'browser', label: '内置浏览器 profile（cookie / 缓存）', path: p.browser, ...dirSize(p.browser), keepIn: [] },
-    { key: 'temp', label: '临时文件 / 损坏备份', path: config.dataDir, bytes: tempBytes, files: temps.length, keepIn: [] },
+    { key: 'browser', label: '内置浏览器缓存', path: p.browser, ...dirSize(p.browser), keepIn: [] },
+    { key: 'temp', label: '临时文件', path: config.dataDir, bytes: tempBytes, files: temps.length, keepIn: [] },
   ];
 
   let disk = null;
@@ -121,7 +121,7 @@ export function cleanupPreview(level) {
       rows.push({ key: t, label: byKey[t].label, bytes: byKey[t].bytes, files: byKey[t].files });
       bytes += byKey[t].bytes;
     } else if (t === 'status') {
-      rows.push({ key: 'status', label: '账号状态快照（探活结果、额度快照）', bytes: 0, files: store.accounts.length });
+      rows.push({ key: 'status', label: '账号状态快照', bytes: 0, files: store.accounts.length });
     } else if (t === 'accounts') {
       rows.push({ key: 'accounts', label: `账号池（${store.accounts.length} 个号，含 token）`, bytes: 0, files: store.accounts.length });
     } else if (t === 'keys') {
