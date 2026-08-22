@@ -427,7 +427,9 @@ function render() {
   const s = STATE;
   if (!s) return;
 
-  $('#nc-accounts').textContent = s.accounts.length;
+  // s.accounts 可能被截断到前 200 个，计数一律用 accountsTotal
+  const acctTotal = s.accountsTotal ?? s.accounts.length;
+  $('#nc-accounts').textContent = acctTotal;
   $('#nc-keys').textContent = s.keys.length;
   $('#nc-models').textContent = s.models.filter((m) => m.enabled).length;
   $('#m-engine').textContent = s.workerVersion ? `worker ${s.workerVersion}` : '未知';
@@ -436,11 +438,14 @@ function render() {
 
   const pill = $('#top-pill');
   // 存活数优先看我们自己探到的状态（引擎观测只是补充），没探过的按"可用"算
-  const okCount = s.accounts.filter((a) => a.enabled && (!a.status || a.status.state === 'ok')).length;
-  const lamp = s.accounts.length === 0 ? 'bad' : okCount > 0 ? 'ok' : 'warn';
+  // 各上游的可用数是服务端统计的（不受截断影响），优先用它
+  const ups = s.providers?.list || [];
+  const okCount = ups.length
+    ? ups.reduce((n, u) => n + (u.accountsEnabled || 0), 0)
+    : s.accounts.filter((a) => a.enabled && (!a.status || a.status.state === 'ok')).length;
+  const lamp = acctTotal === 0 ? 'bad' : okCount > 0 ? 'ok' : 'warn';
   pill.querySelector('.lamp').className = `lamp ${lamp}`;
-  pill.querySelector('span').textContent =
-    s.accounts.length === 0 ? '号池为空' : `${okCount}/${s.accounts.length} 号可用`;
+  pill.querySelector('span').textContent = acctTotal === 0 ? '号池为空' : `${okCount}/${acctTotal} 号可用`;
 
   $('#nc-usage').textContent = fmtCompact(s.usageSummary?.totals?.requests || 0);
   $('#nc-upstreams').textContent = (s.providers?.list || []).length;
@@ -859,22 +864,29 @@ function renderOverview(s) {
     })
   );
 
-  const freeCount = s.accounts.filter((a) => a.pool !== 'paid' && a.enabled).length;
+  // 注意：s.accounts 可能只是前 200 个（见 buildState 的 accountsTruncated）。
+  // 所以"多少个号"一律用 accountsTotal，只有需要逐个看字段的地方才用数组。
+  const total = s.accountsTotal ?? s.accounts.length;
   const calls = s.keys.reduce((n, k) => n + (k.requests || 0), 0);
+  // 能跑免费模型的比例：截断时按已知那部分估，标个"约"字
+  const freeCount = s.accounts.filter((a) => a.pool !== 'paid' && a.enabled).length;
+  const freeText = s.accountsTruncated
+    ? `约 ${Math.round((freeCount / Math.max(1, s.accounts.length)) * total)} 个能跑免费模型`
+    : `${freeCount} 个能跑免费模型`;
   const activeAcct = s.accounts.find((a) => a.active);
   // 每个上游各有策略，概览里只说"有几种"，细节在「上游」那一页
   const modes = new Set((s.providers?.list || []).filter((u) => u.accounts > 0).map((u) => u.rotation.mode));
   const rotLabels = s.providers?.rotations || {};
   const mode = modes.size === 1 ? rotLabels[[...modes][0]] || [...modes][0] : `${modes.size} 种策略`;
-  $('#pool-summary').textContent = s.accounts.length
-    ? `${s.accounts.length} 号 · ${freeCount} 个能跑免费模型 · 累计 ${calls} 次调用 · 切换策略：${mode}${
+  $('#pool-summary').textContent = total
+    ? `${total} 号 · ${freeText} · 累计 ${calls} 次调用 · 切换策略：${mode}${
         activeAcct ? ` · 当前 ${activeAcct.email || activeAcct.id}` : ''
       }`
     : '空池 —— 先加一个号';
 
   // 上手三步（真实顺序，做完了就打勾）
   const steps = [
-    { done: s.accounts.length > 0, label: '给某个上游加 Key', hint: 'freebuff 走登录，opencode / 自定义上游直接贴 key' },
+    { done: total > 0, label: '给某个上游加 Key', hint: 'freebuff 走登录，opencode / 自定义上游直接贴 key' },
     { done: s.keys.length > 0, label: '复制 Base URL 和 Key 到客户端', hint: '上面「复制完整配置」一键带走' },
     { done: Boolean(window.__selftestPassed), label: '跑一次自检确认链路通', hint: '右上「运行自检」' },
   ];
@@ -890,28 +902,43 @@ function renderOverview(s) {
 }
 
 let acctFilter = 'all';
+// 号池可能有几千个 key，/state 只带前 200 个。这里存"额外取回来的那些"，
+// 按上游筛或搜索时直接问服务端要（GET /accounts/page）。
+let acctExtra = null; // { key, total, rows } —— key 是 filter+q 的组合，变了就重取
+let acctQuery = '';
 
 function renderAccounts(s) {
   const tbody = $('#acct-table tbody');
   const ups = s.providers?.list || [];
+  const grandTotal = s.accountsTotal ?? s.accounts.length;
   // 号多起来之后按上游分组看更清楚；只有一个上游时不显示这排按钮
   const withAccounts = ups.filter((u) => u.accounts > 0);
-  if (!withAccounts.some((u) => u.id === acctFilter)) acctFilter = 'all';
+  if (acctFilter !== 'all' && !withAccounts.some((u) => u.id === acctFilter)) acctFilter = 'all';
   $('#acct-filter').innerHTML =
     withAccounts.length > 1
-      ? `<button data-f="all" class="${acctFilter === 'all' ? 'is-on' : ''}">全部 ${s.accounts.length}</button>` +
+      ? `<button data-f="all" class="${acctFilter === 'all' ? 'is-on' : ''}">全部 ${grandTotal}</button>` +
         withAccounts.map((u) => `<button data-f="${u.id}" class="${acctFilter === u.id ? 'is-on' : ''}">${esc(u.name)} ${u.accounts}</button>`).join('')
       : '';
   $$('#acct-filter button').forEach((b) =>
     b.addEventListener('click', () => {
       acctFilter = b.dataset.f;
-      renderAccounts(STATE);
+      acctExtra = null;
+      // 筛选或搜索时让服务端出结果：本地那 200 个不一定包含目标
+      if (acctFilter !== 'all' || acctQuery) loadAccountPage();
+      else renderAccounts(STATE);
     })
   );
 
-  const rows = acctFilter === 'all' ? s.accounts : s.accounts.filter((a) => (a.provider || 'freebuff') === acctFilter);
-  $('#acct-blank').classList.toggle('hidden', s.accounts.length > 0);
-  $('#acct-table').classList.toggle('hidden', s.accounts.length === 0);
+  // 用哪份数据：服务端取回来的优先，否则用 /state 里带的那一批
+  const useExtra = acctExtra && acctExtra.key === `${acctFilter}|${acctQuery}`;
+  const rows = useExtra
+    ? acctExtra.rows
+    : acctFilter === 'all'
+      ? s.accounts
+      : s.accounts.filter((a) => (a.provider || 'freebuff') === acctFilter);
+  const shownTotal = useExtra ? acctExtra.total : grandTotal;
+  $('#acct-blank').classList.toggle('hidden', grandTotal > 0);
+  $('#acct-table').classList.toggle('hidden', grandTotal === 0);
   tbody.innerHTML = rows
     .map((a) => {
       const st = a.status;
@@ -954,9 +981,20 @@ function renderAccounts(s) {
     tr.children[4]?.classList.toggle('hidden', !anyToken);
   });
 
+  // 表尾：显示了几条 / 共几条，需要时给一个「再取一批」
+  const foot = $('#acct-foot');
+  foot.classList.toggle('hidden', grandTotal === 0);
+  $('#acct-count').textContent =
+    rows.length >= shownTotal ? `共 ${shownTotal} 个` : `显示 ${rows.length} / ${shownTotal} 个`;
+  const more = $('#acct-more');
+  more.classList.toggle('hidden', rows.length >= shownTotal);
+  more.disabled = false;
+  more.textContent = `再取 ${Math.min(200, shownTotal - rows.length)} 个`;
+
   $$('#acct-table tbody tr').forEach((tr) => {
     const id = tr.dataset.id;
-    const acct = s.accounts.find((a) => a.id === id);
+    // 行有可能来自服务端分页那一批，不在 s.accounts 里 —— 两边都找一下
+    const acct = rows.find((a) => a.id === id) || s.accounts.find((a) => a.id === id) || {};
     $('.js-pool', tr).addEventListener('change', async (ev) => {
       await api(`/accounts/${id}`, { method: 'PATCH', body: { pool: ev.target.value } });
       toast(`${acct.email || id} 的用途改成「${POOL_FULL[ev.target.value]}」`);
@@ -1281,6 +1319,50 @@ $('#btn-selftest').addEventListener('click', async () => {
   } finally {
     btn.disabled = false;
   }
+});
+
+/**
+ * 从服务端取一批账号。/state 只带前 200 个，按上游筛或搜索时目标可能不在里面，
+ * 所以这些操作一律问服务端要。append=true 是「再取一批」。
+ */
+async function loadAccountPage({ append = false } = {}) {
+  const key = `${acctFilter}|${acctQuery}`;
+  // 「再取一批」的起点：已经取过就接着往后，否则从 /state 带来的那批之后开始 ——
+  // 不能一律从 0 开始，那样第一次点「再取」只会把原来那 200 个重新拿一遍
+  let have = [];
+  if (append) {
+    if (acctExtra?.key === key) have = acctExtra.rows;
+    else if (acctFilter === 'all' && !acctQuery) have = STATE?.accounts || [];
+  }
+  try {
+    const qs = new URLSearchParams({ offset: String(have.length), limit: '200' });
+    if (acctFilter !== 'all') qs.set('provider', acctFilter);
+    if (acctQuery) qs.set('q', acctQuery);
+    const r = await api(`/accounts/page?${qs}`);
+    acctExtra = { key, total: r.total, rows: [...have, ...r.accounts] };
+    renderAccounts(STATE);
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
+$('#acct-more').addEventListener('click', (ev) => {
+  ev.currentTarget.disabled = true;
+  ev.currentTarget.innerHTML = '<span class="spin"></span>';
+  loadAccountPage({ append: true });
+});
+
+let acctSearchTimer = null;
+$('#acct-search').addEventListener('input', (ev) => {
+  const v = ev.target.value.trim();
+  clearTimeout(acctSearchTimer);
+  // 打字防抖：别每敲一个字就打一次服务端
+  acctSearchTimer = setTimeout(() => {
+    acctQuery = v;
+    acctExtra = null;
+    if (acctQuery || acctFilter !== 'all') loadAccountPage();
+    else renderAccounts(STATE);
+  }, 250);
 });
 
 $('#btn-check-all').addEventListener('click', async () => {

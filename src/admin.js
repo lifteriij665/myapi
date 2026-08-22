@@ -162,6 +162,9 @@ async function checkAccount(acct) {
  * 所以按固定并发跑；上限不能太高，不然会被上游当成扫号。
  */
 const PROBE_CONCURRENCY = 6;
+// /state 里最多带这么多个账号。号池能有几千个 key，全量下发会让每 20 秒一次的
+// 轮询变成 MB 级流量，而控制台一屏也看不完 —— 超出的用 /accounts/page 按需取。
+const ACCOUNT_PAGE = 200;
 
 async function checkAccounts(accounts) {
   const results = [];
@@ -198,16 +201,22 @@ async function liveModelIds() {
   }
 }
 
-/** SSE 推送用的轻量快照：不碰上游、不遍历磁盘（chatLogStatus 内部有 10 秒缓存） */
+/**
+ * SSE 推送用的轻量快照。这条路每 2 秒跑一次，所以只放**真正会变**的东西：
+ * 用量计数、最近明细、聊天记录大小。
+ *
+ * 账号和 key 列表故意不放：前端只从 LIVE 里读 usage 和 at，那两个数组
+ * 从来没被用过，但 5000 个 key 时它们能把单帧撑到 622KB —— 每分钟往每个
+ * 打开的控制台推 18MB。账号状态的变化由 20 秒一次的 /state 负责。
+ */
 function liveSnapshot() {
   const chat = chatLogStatus();
-  const activeId = store.settings.activeAccountId;
   return {
     at: nowIso(),
     usage: {
       totals: usage.data.totals,
       // 直接读今天那个桶。别用 usage.snapshot()：它会顺手算 48 小时 + 30 天序列
-      // 和四组 topBy 排序，而这里只要 today 一个字段 —— 这条路每 2 秒跑一次
+      // 和四组 topBy 排序，而这里只要 today 一个字段
       today: usage.today(),
       windows: {
         m5: usage.windowStats(5 * 60_000),
@@ -217,17 +226,6 @@ function liveSnapshot() {
       recent: usage.recent(14),
       eventsHeld: usage.events.length,
     },
-    accounts: store.accounts.map((a) => ({
-      id: a.id,
-      email: a.email || '',
-      provider: providerOf(a),
-      active: activeId === a.id,
-      enabled: a.enabled !== false,
-      state: a.status?.state || null,
-      verdict: a.status?.verdict || null,
-      quota: a.status?.quota || '',
-    })),
-    keys: store.keys.map((k) => ({ id: k.id, name: k.name, requests: k.requests || 0, lastUsedAt: k.lastUsedAt })),
     chatlog: { enabled: chat.enabled, files: chat.files, bytes: chat.bytes, full: chat.full },
   };
 }
@@ -266,6 +264,11 @@ async function buildState(req) {
   // 模型表是 /state 里最大的一块（几百个模型时 200KB+），但它几乎不变。
   // 给它算一个指纹：控制台每 20 秒轮询一次，指纹没变就不用重发。
   const modelsTag = modelFingerprint(models);
+  // 账号列表是 /state 的绝对大头（5000 个 key 时占 97%，整包 1.2MB，每 20 秒一次）。
+  // 控制台一次也看不完那么多行，所以只发前 ACCOUNT_PAGE 个 + 一个总数，
+  // 剩下的按上游筛或搜出来 —— 见 GET /accounts/page。
+  const allAccounts = store.accounts;
+  const sliced = allAccounts.length > ACCOUNT_PAGE;
   return {
     ok: true,
     version: config.version,
@@ -281,7 +284,9 @@ async function buildState(req) {
     },
     browser: browserFeature(),
     settings: store.settings,
-    accounts: store.accounts.map((a) => accountView(a, workerStates)),
+    accounts: (sliced ? allAccounts.slice(0, ACCOUNT_PAGE) : allAccounts).map((a) => accountView(a, workerStates)),
+    accountsTotal: allAccounts.length,
+    accountsTruncated: sliced,
     keys: store.keys.map(keyView),
     modelsTag,
     models,
@@ -423,6 +428,32 @@ export async function handleAdminApi(req, res, url) {
       }
     }
     return sendJson(res, 200, { ok: true, added: added.length, ids: added });
+  }
+
+  // 按需分页取账号：/state 只带前 ACCOUNT_PAGE 个，剩下的从这里拿。
+  // 支持按上游筛和按关键字搜（邮箱 / 备注名 / 打码后的凭据）。
+  if (path === '/accounts/page' && method === 'GET') {
+    const provider = url.searchParams.get('provider') || '';
+    const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+    const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || String(ACCOUNT_PAGE), 10) || ACCOUNT_PAGE));
+    let rows = store.accounts;
+    if (provider) rows = rows.filter((a) => providerOf(a) === provider);
+    if (q) {
+      // 凭据按**原文**匹配：打码后的 sk-bulk-…0042 中间是省略号，
+      // 拿完整 key 去搜永远搜不到。原文只用来比较，返回的仍然是打码值。
+      rows = rows.filter((a) =>
+        [a.email, a.name, a.token].some((v) => String(v || '').toLowerCase().includes(q))
+      );
+    }
+    const workerStates = new Map();
+    return sendJson(res, 200, {
+      ok: true,
+      total: rows.length,
+      offset,
+      limit,
+      accounts: rows.slice(offset, offset + limit).map((a) => accountView(a, workerStates)),
+    });
   }
 
   if (path === '/accounts/check-all' && method === 'POST') {

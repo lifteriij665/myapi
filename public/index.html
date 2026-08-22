@@ -172,6 +172,7 @@
       <div class="toolbar">
         <div class="seg" id="acct-filter"></div>
         <span class="grow"></span>
+        <input type="search" id="acct-search" placeholder="搜邮箱 / 备注 / 凭据" class="search">
         <span class="toolbar-acts">
           <button class="btn" id="btn-check-all">全部检测</button>
           <button class="btn primary" id="btn-add-account">添加账号</button>
@@ -190,6 +191,11 @@
           <b>号池是空的</b>
           <p>加一个号，网关才有东西可路由。用「授权链接」方式，几十秒就能加一个。</p>
           <button class="btn primary" data-act="add-account">添加账号</button>
+        </div>
+        <div class="tfoot hidden" id="acct-foot">
+          <span id="acct-count" class="muted small"></span>
+          <span class="grow"></span>
+          <button class="btn tiny hidden" id="acct-more">再load 200 个</button>
         </div>
       </div>
     </section>

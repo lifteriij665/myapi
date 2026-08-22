@@ -367,5 +367,56 @@ check(
 
 await admin(`/accounts/${ocAdd.json.ids[0]}`, 'DELETE');
 
+// ── 账号分页：号池可能有几千个 key，/state 不能整份下发 ──
+// 实测 5000 个 key 时整包 1.2MB、SSE 单帧 622KB，而这两条路分别每 20 秒 / 2 秒跑一次。
+const bulkUp = (await admin('/upstreams', 'POST', { name: 'page-test', format: 'chat', baseUrl: 'https://pagetest.example.com/v1' })).json;
+if (bulkUp?.upstream) {
+  const upId = bulkUp.upstream.id;
+  const bulkKeys = Array.from({ length: 260 }, (_, i) => `sk-pagetest-${String(i).padStart(14, '0')}`).join('\n');
+  const bulkAdd = await admin(`/upstreams/${upId}/keys`, 'POST', { keys: bulkKeys });
+  check('一次贴 260 个 key 能全进池', bulkAdd.json?.added === 260, JSON.stringify(bulkAdd.json).slice(0, 120));
+
+  const paged = await admin('/state');
+  check('账号超过 200 个时 /state 只带前 200 个', paged.json.accounts.length === 200, String(paged.json.accounts.length));
+  check('但会给出真实总数和截断标记', paged.json.accountsTotal > 200 && paged.json.accountsTruncated === true, `total=${paged.json.accountsTotal}`);
+  check(
+    '截断后 /state 体积可控（<300KB）',
+    JSON.stringify(paged.json).length < 300 * 1024,
+    `${(JSON.stringify(paged.json).length / 1024).toFixed(0)}KB`
+  );
+
+  const page2 = await admin('/accounts/page?offset=200&limit=200');
+  check(
+    '分页能取到第 200 个之后的',
+    page2.json.accounts.length > 0 && page2.json.total === paged.json.accountsTotal,
+    JSON.stringify({ n: page2.json.accounts.length, total: page2.json.total })
+  );
+  const byUp = await admin(`/accounts/page?provider=${upId}`);
+  check('分页能按上游筛', byUp.json.total === 260, String(byUp.json.total));
+  // 凭据要能按原文搜到：打码值中间是省略号，拿完整 key 去搜打码值永远搜不到
+  const hit = await admin('/accounts/page?q=sk-pagetest-00000000000042');
+  check('能按完整凭据搜到', hit.json.total === 1, String(hit.json.total));
+  check('搜索结果里凭据仍然是打码的', /…/.test(hit.json.accounts[0]?.tokenMasked || ''), hit.json.accounts[0]?.tokenMasked);
+  check('搜索响应里不含明文凭据', !JSON.stringify(hit.json).includes('sk-pagetest-00000000000042'), '明文 key 漏出去了');
+
+  // SSE 帧里不该再带账号 / key 列表：前端只读 usage，那两个数组能把帧撑到几百 KB
+  const evResp = await fetch(`${BASE}/admin/api/events`, { headers: { cookie } });
+  const reader = evResp.body.getReader();
+  const dec = new TextDecoder();
+  let evBuf = '';
+  while (!evBuf.includes('\n\n')) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    evBuf += dec.decode(value, { stream: true });
+  }
+  reader.cancel().catch(() => {});
+  const frame = JSON.parse((evBuf.match(/^data: (.*)$/m) || [])[1] || '{}');
+  check('SSE 帧不带账号列表', !('accounts' in frame), Object.keys(frame).join(','));
+  check('SSE 帧仍然带用量', typeof frame.usage?.totals?.requests === 'number', JSON.stringify(frame).slice(0, 120));
+  check('SSE 单帧够小（<40KB）', evBuf.length < 40 * 1024, `${(evBuf.length / 1024).toFixed(1)}KB`);
+
+  await admin(`/upstreams/${upId}`, 'DELETE');
+}
+
 console.log(`\n集成测试：通过 ${pass} / 失败 ${fail}`);
 process.exit(fail ? 1 : 0);

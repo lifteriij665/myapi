@@ -951,6 +951,16 @@ dialog::backdrop { background: rgba(4, 8, 9, 0.72); backdrop-filter: blur(3px); 
   .storelist .si-bar { grid-column: 1 / -1; }
 }
 
+/* 表尾：显示了几条 / 共几条 + 「再取一批」 */
+.tfoot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--edge);
+  background: var(--ink-2);
+}
+
 /* ── 提示条 ── */
 .toasts { position: fixed; right: 16px; bottom: 16px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: min(420px, calc(100vw - 32px)); }
 .toast {
