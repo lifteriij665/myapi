@@ -1478,24 +1478,28 @@ const poolSelect = (id, selected = 'any') => `<label class="field" style="max-wi
 </label>`;
 
 /** 内置浏览器画面的那一块 HTML（两个弹窗共用，按 id 前缀区分） */
+// 内置浏览器那一块的 HTML。id 一律用 `<前缀>-vw-*`：
+// 早先这里的「前往」按钮是 `<前缀>-go`，正好和 opencode 弹窗里「加入号池」的
+// id 撞了，$() 取到藏在 .viewer.hidden 里的那个，导致 key 根本提交不上去。
+// 加个 -vw- 段把命名空间隔开。
 const viewerMarkup = (p) => `<div class="viewer hidden" id="${p}-viewer">
   <div class="viewer-bar">
     <button class="btn tiny" data-nav="back" type="button" title="后退">←</button>
     <button class="btn tiny" data-nav="forward" type="button" title="前进">→</button>
     <button class="btn tiny" data-nav="reload" type="button" title="刷新">↻</button>
-    <input type="text" id="${p}-url" placeholder="https://" class="grow">
-    <button class="btn tiny" id="${p}-go" type="button">前往</button>
-    <span class="pill"><i class="lamp" id="${p}-lamp"></i><span id="${p}-conn">未连接</span></span>
+    <input type="text" id="${p}-vw-url" placeholder="https://" class="grow">
+    <button class="btn tiny" id="${p}-vw-go" type="button">前往</button>
+    <span class="pill"><i class="lamp" id="${p}-vw-lamp"></i><span id="${p}-vw-conn">未连接</span></span>
   </div>
-  <div class="screen" id="${p}-screen" tabindex="0">
-    <img id="${p}-img" alt="服务器浏览器画面">
-    <div class="glass" id="${p}-glass"></div>
-    <div class="veil" id="${p}-veil"><span><span class="spin"></span> 正在启动 Chromium，首次大约 5~15 秒…</span></div>
+  <div class="screen" id="${p}-vw-screen" tabindex="0">
+    <img id="${p}-vw-img" alt="服务器浏览器画面">
+    <div class="glass" id="${p}-vw-glass"></div>
+    <div class="veil" id="${p}-vw-veil"><span><span class="spin"></span> 正在启动 Chromium，首次大约 5~15 秒…</span></div>
   </div>
   <div class="viewer-bar">
-    <input type="text" id="${p}-text" placeholder="要输入的文字 —— 先在画面里点一下输入框，再发送" class="grow">
-    <button class="btn tiny" id="${p}-send" type="button">发送文字</button>
-    <button class="btn tiny" id="${p}-enter" type="button">回车</button>
+    <input type="text" id="${p}-vw-text" placeholder="要输入的文字 —— 先在画面里点一下输入框，再发送" class="grow">
+    <button class="btn tiny" id="${p}-vw-send" type="button">发送文字</button>
+    <button class="btn tiny" id="${p}-vw-enter" type="button">回车</button>
   </div>
 </div>`;
 
@@ -1505,9 +1509,9 @@ const viewerMarkup = (p) => `<div class="viewer hidden" id="${p}-viewer">
  * ws 的所有权留在调用方（它要负责关闭），这里通过 io.get/io.set 存取。
  */
 function mountViewer(prefix, R, io, { onFrame } = {}) {
-  const img = $(`#${prefix}-img`, R);
-  const glass = $(`#${prefix}-glass`, R);
-  const screen = $(`#${prefix}-screen`, R);
+  const img = $(`#${prefix}-vw-img`, R);
+  const glass = $(`#${prefix}-vw-glass`, R);
+  const screen = $(`#${prefix}-vw-screen`, R);
   if (!screen) return null;
   const send = (msg) => {
     const ws = io.get();
@@ -1530,9 +1534,9 @@ function mountViewer(prefix, R, io, { onFrame } = {}) {
   };
 
   const conn = (state, text) => {
-    const lamp = $(`#${prefix}-lamp`, R);
+    const lamp = $(`#${prefix}-vw-lamp`, R);
     if (lamp) lamp.className = `lamp ${state}`;
-    const label = $(`#${prefix}-conn`, R);
+    const label = $(`#${prefix}-vw-conn`, R);
     if (label) label.textContent = text;
   };
 
@@ -1551,15 +1555,15 @@ function mountViewer(prefix, R, io, { onFrame } = {}) {
       }
       if (m.t === 'frame') {
         img.src = `data:image/jpeg;base64,${m.data}`;
-        $(`#${prefix}-veil`, R).classList.add('hidden');
+        $(`#${prefix}-vw-veil`, R).classList.add('hidden');
         conn('ok', '已连接');
         onFrame?.();
       } else if (m.t === 'status') {
-        const box = $(`#${prefix}-url`, R);
+        const box = $(`#${prefix}-vw-url`, R);
         if (box && document.activeElement !== box) box.value = m.url || '';
       } else if (m.t === 'closed') {
         conn('bad', '已断开');
-        const veil = $(`#${prefix}-veil`, R);
+        const veil = $(`#${prefix}-vw-veil`, R);
         veil.classList.remove('hidden');
         veil.innerHTML = '<span>浏览器已关闭。重新点上面的按钮可以再开一个。</span>';
       } else if (m.t === 'error') {
@@ -1613,20 +1617,20 @@ function mountViewer(prefix, R, io, { onFrame } = {}) {
   $$('[data-nav]', viewer || R).forEach((b) =>
     b.addEventListener('click', () => send({ t: b.getAttribute('data-nav') }))
   );
-  $(`#${prefix}-go`, R)?.addEventListener('click', () => send({ t: 'navigate', url: $(`#${prefix}-url`, R).value }));
-  $(`#${prefix}-url`, R)?.addEventListener('keydown', (ev) => {
+  $(`#${prefix}-vw-go`, R)?.addEventListener('click', () => send({ t: 'navigate', url: $(`#${prefix}-vw-url`, R).value }));
+  $(`#${prefix}-vw-url`, R)?.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') send({ t: 'navigate', url: ev.target.value });
   });
-  $(`#${prefix}-send`, R)?.addEventListener('click', () => {
-    const box = $(`#${prefix}-text`, R);
+  $(`#${prefix}-vw-send`, R)?.addEventListener('click', () => {
+    const box = $(`#${prefix}-vw-text`, R);
     if (!box.value) return;
     send({ t: 'text', text: box.value });
     box.value = '';
   });
-  $(`#${prefix}-text`, R)?.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Enter') $(`#${prefix}-send`, R).click();
+  $(`#${prefix}-vw-text`, R)?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') $(`#${prefix}-vw-send`, R).click();
   });
-  $(`#${prefix}-enter`, R)?.addEventListener('click', () => send({ t: 'key', key: 'Enter' }));
+  $(`#${prefix}-vw-enter`, R)?.addEventListener('click', () => send({ t: 'key', key: 'Enter' }));
   return { connect, screen, send };
   }
 
@@ -1869,7 +1873,7 @@ function openFreebuffAdd() {
         brViewer.screen.focus();
       } catch (err) {
         toast(err.message, 'err', 9000);
-        $('#br-veil', R).innerHTML = `<span>${esc(err.message)}</span>`;
+        $('#br-vw-veil', R).innerHTML = `<span>${esc(err.message)}</span>`;
       } finally {
         btn.disabled = false;
         btn.textContent = '重新启动';
@@ -1901,7 +1905,7 @@ function openOpencodeAdd() {
     ${viewerMarkup('oc')}
     <label class="field" style="margin-top:12px"><span class="lbl">Zen API key（sk- 开头，一行一个）</span>
       <textarea id="oc-token" placeholder="sk-…"></textarea></label>
-    <div class="btnrow"><button class="btn primary" id="oc-go" type="button">加入号池</button></div>
+    <div class="btnrow"><button class="btn primary" id="oc-submit" type="button">加入号池</button></div>
     <div class="flowstate" id="oc-state"></div>`,
     { width: 1040, onClose: () => teardown() }
   );
@@ -1943,14 +1947,14 @@ function openOpencodeAdd() {
         '<i class="lamp busy"></i><span>在画面里登录，然后到 Zen 控制台复制 API key，粘到下面的框里</span>';
     } catch (err) {
       toast(err.message, 'err', 9000);
-      $('#oc-veil', R).innerHTML = `<span>${esc(err.message)}</span>`;
+      $('#oc-vw-veil', R).innerHTML = `<span>${esc(err.message)}</span>`;
     } finally {
       btn.disabled = false;
       btn.textContent = '重新启动';
     }
   });
 
-  $('#oc-go', R).addEventListener('click', async (ev) => {
+  $('#oc-submit', R).addEventListener('click', async (ev) => {
     const raw = $('#oc-token', R).value.trim();
     if (!raw) return toast('先把 API key 粘进来', 'warn');
     const btn = ev.currentTarget;

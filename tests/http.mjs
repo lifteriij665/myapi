@@ -56,7 +56,11 @@ check('能从 state 里挑出免费/付费模型', Boolean(FREE_MODEL && PAID_MO
 check('state 正常', st.status === 200 && Array.isArray(st.json.models), `${st.status}`);
 
 const models = await (await raw('/v1/models', { headers: { authorization: `Bearer ${KEY}` } })).json();
-check('免费 key 只看到免费模型', models.data.every((m) => !/luna|v4-pro|minimax|muse-spark|kimi/.test(m.id)), JSON.stringify(models.data?.map((m) => m.id)));
+// 按 /state 给出的 tier 判，别按模型名猜 —— 上游会改分类
+// （gpt-5.6-luna-es 就从 premium 挪进了 standard 池，按名字猜会误判成泄露）
+const tierById = new Map(st.json.models.map((m) => [m.id, m.tier]));
+const leaked = models.data.map((m) => m.id).filter((id) => tierById.get(id) === 'paid');
+check('免费 key 只看到免费模型', leaked.length === 0, `漏出的付费模型：${JSON.stringify(leaked)}`);
 
 const paid = await raw('/v1/chat/completions', {
   method: 'POST',
@@ -315,10 +319,11 @@ check(
   !liveIds.includes(OC_PAID) && liveIds.includes(OC_FREE),
   JSON.stringify(liveIds.filter((i) => i.startsWith('opencode/')))
 );
+const tierById2 = new Map(st2.json.models.map((m) => [m.id, m.tier]));
 check(
-  '免费 key 的模型列表里没有 freebuff 的付费模型',
-  liveIds.filter((i) => !i.startsWith('opencode/')).every((i) => !/luna|v4-pro|minimax|muse-spark|kimi/.test(i)),
-  JSON.stringify(liveIds)
+  '免费 key 的模型列表里没有任何付费模型',
+  liveIds.filter((i) => tierById2.get(i) === 'paid').length === 0,
+  `漏出的付费模型：${JSON.stringify(liveIds.filter((i) => tierById2.get(i) === 'paid'))}`
 );
 check(
   '地区受限的 Zen 模型默认不对外提供',
