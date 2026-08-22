@@ -508,6 +508,11 @@ function renderUpstreams(s) {
             .join('')}</div>
           <p class="rot-hint">${esc(hints[u.rotation.mode] || '')}</p>
         </div>
+        ${
+          // 单号策略才需要"用哪个号"。放在卡上而不是设置页：这个选择本来就是
+          // 每个上游一份的，放在全局设置里既是第二个入口，也表达不了"哪个上游"
+          u.rotation.mode === 'single' ? `<div class="up-rot"><span>固定用哪个号</span><select class="js-pin"></select></div>` : ''
+        }
         ${modelPills}
         ${
           u.builtin
@@ -546,6 +551,37 @@ function renderUpstreams(s) {
     });
 
     $('.js-addkeys', card).addEventListener('click', () => openAddAccount(live().id));
+
+    // 单号策略的「固定用哪个号」：这个上游的号可能不在 /state 带来的那 200 个里，
+    // 所以按需去服务端取一份
+    const pin = $('.js-pin', card);
+    if (pin) {
+      const cur = live().rotation.activeAccountId || '';
+      pin.innerHTML = '<option value="">（自动挑第一个可用的）</option>';
+      api(`/accounts/page?provider=${encodeURIComponent(id)}&limit=500`)
+        .then((r) => {
+          pin.innerHTML =
+            '<option value="">（自动挑第一个可用的）</option>' +
+            (r.accounts || [])
+              .map(
+                (a) =>
+                  `<option value="${esc(a.id)}"${a.id === cur ? ' selected' : ''}${a.enabled ? '' : ' disabled'}>${esc(
+                    a.email || a.name || a.tokenMasked
+                  )}${a.enabled ? '' : '（已停用）'}</option>`
+              )
+              .join('');
+        })
+        .catch(() => {});
+      pin.addEventListener('change', async (ev) => {
+        try {
+          await api(`/upstreams/${id}/rotation`, { method: 'POST', body: { activeAccountId: ev.target.value || null } });
+          toast(ev.target.value ? `${live().name} 固定用这个号了` : `${live().name} 恢复自动挑第一个可用的`);
+          sync(true);
+        } catch (err) {
+          toast(err.message, 'err');
+        }
+      });
+    }
     $('.js-more', card)?.addEventListener('click', (ev) => {
       const box = $('.up-more', card);
       box.classList.toggle('hidden');
@@ -1214,35 +1250,6 @@ $('#btn-model-status-reset').addEventListener('click', async () => {
 });
 
 function renderSettings(s) {
-  // 换号策略总览：一行一个上游，点「去设置」跳到那一页改
-  const rotations = s.providers?.rotations || {};
-  $('#rot-overview').innerHTML = (s.providers?.list || [])
-    .map(
-      (u) => `<div class="rr"><span class="rr-name" title="${esc(u.name)}">${esc(u.name)}</span>
-      <span class="rr-mode">${esc(rotations[u.rotation.mode] || u.rotation.mode)}</span>
-      <span class="rr-keys">${u.accountsEnabled}/${u.accounts}</span></div>`
-    )
-    .join('');
-  const sel = $('#set-active');
-  const cur = s.settings.activeAccountId || '';
-  sel.innerHTML =
-    '<option value="">（自动挑一个可用的）</option>' +
-    s.accounts
-      .map(
-        (a) =>
-          `<option value="${a.id}"${a.id === cur ? ' selected' : ''}${a.enabled ? '' : ' disabled'}>${esc(
-            a.email || a.name || a.id
-          )}${a.enabled ? '' : '（已停用）'}</option>`
-      )
-      .join('');
-  const activeAcct = s.accounts.find((a) => a.id === cur);
-  const singles = (s.providers?.list || []).filter((u) => u.rotation.mode === 'single');
-  $('#rotation-note').textContent = singles.length
-    ? activeAcct
-      ? `${singles.map((u) => u.name).join('、')} 是单号策略：固定用 ${activeAcct.email || activeAcct.name || activeAcct.id}，失败也不换号。`
-      : `${singles.map((u) => u.name).join('、')} 是单号策略，但还没指定账号 —— 会退到那个上游第一个可用的号。`
-    : '当前没有上游用单号策略，这个下拉只作为各上游的起点提示。';
-
   $('#set-allowpaid').checked = Boolean(s.settings.allowPaidDefault);
   // 目录和持久性挤在一行：持久性是这个目录的属性，分成两行反而要来回看
   $('#s-datadir').textContent = `${s.storage.dir}　${s.storage.persistent ? '持久' : '临时 · 重新部署会清空'}`;
@@ -1405,12 +1412,6 @@ $('#btn-model-refresh').addEventListener('click', async () => {
 $('#set-allowpaid').addEventListener('change', async (ev) => {
   await api('/settings', { method: 'PATCH', body: { allowPaidDefault: ev.target.checked } });
   toast('已保存');
-});
-$('#btn-goto-upstreams').addEventListener('click', () => show('upstreams'));
-$('#set-active').addEventListener('change', async (ev) => {
-  await api('/settings', { method: 'PATCH', body: { activeAccountId: ev.target.value || null } });
-  toast(ev.target.value ? '已指定当前账号' : '已放开指定，下一次请求自己挑');
-  sync(true);
 });
 $('#btn-export').addEventListener('click', async () => {
   const btn = $('#btn-export');

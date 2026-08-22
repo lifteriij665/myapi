@@ -264,21 +264,12 @@
     <!-- ─────────── 设置 ─────────── -->
     <section class="view hidden" data-view="settings">
       <!-- 设置就是一串键值对，所以照着控制台已有的 .wire 语言排成一条连续的行列表，
-           而不是七个高度参差的方盒子。左边等宽标签、右边控件、再右边动作。 -->
+           而不是七个高度参差的方盒子。左边等宽标签、右边控件、再右边动作。
+           换号策略不在这里 —— 它天生是"每个上游一套"，就该在「上游」页的卡上改，
+           在这儿再放一份总览+跳转只是同一件事的第二个入口。 -->
       <div class="setgroup">
-        <div class="eyebrow"><b>换号</b><span>ROTATION</span>
-          <span class="eyebrow-note">策略每个上游各一套，在「上游」页改</span>
-        </div>
+        <div class="eyebrow"><b>默认行为</b><span>DEFAULTS</span></div>
         <div class="setlist">
-          <div class="setrow" id="rot-overview"></div>
-          <div class="setrow">
-            <span class="sk">单号时用</span>
-            <div class="sv">
-              <select id="set-active"></select>
-              <p class="sh" id="rotation-note"></p>
-            </div>
-            <div class="sa"><button class="btn" id="btn-goto-upstreams" type="button">改策略</button></div>
-          </div>
           <div class="setrow">
             <span class="sk">新 Key 默认</span>
             <div class="sv">

@@ -425,34 +425,9 @@ a:hover { text-decoration: underline; }
 .inline-toggle span { font-size: 13px; }
 .btnrow.flat { margin-top: 0; }
 
-/* 换号策略总览：塞在一个 setrow 里，自己是个小两列表 */
-#rot-overview { display: grid; grid-template-columns: 1fr; gap: 0; grid-column: 1 / -1; }
-#rot-overview .rr {
-  display: grid;
-  grid-template-columns: 116px minmax(0, 1fr) auto;
-  gap: 18px;
-  padding: 5px 0;
-  align-items: baseline;
-}
-#rot-overview .rr + .rr { border-top: 1px dashed var(--edge); }
-#rot-overview .rr-name {
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--muted-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-#rot-overview .rr-mode { font-size: 12.5px; color: var(--text); }
-#rot-overview .rr-keys { font-family: var(--mono); font-size: 11px; color: var(--muted-2); }
-
 @media (max-width: 720px) {
   .setrow { grid-template-columns: 1fr; }
   .setrow > .sk { padding-top: 0; }
-  /* 策略总览那几行本来就短，窄屏也保持一行：名字 + 策略 + 号数 */
-  #rot-overview .rr { grid-template-columns: minmax(0, 1fr) auto; row-gap: 2px; }
-  #rot-overview .rr-name { grid-column: 1 / -1; }
 }
 
 /* ── 选上游（添加账号的第一步）── */

@@ -497,14 +497,17 @@ class Store {
     }
     if (Array.isArray(patch.disabledModels)) s.disabledModels = patch.disabledModels.map(String);
     if (patch.rotationRules && typeof patch.rotationRules === 'object') {
-      // 值的形状由 upstreams.js 校验过；这里只保证是个对象，别把整棵设置写坏
+      // 值的形状由 upstreams.js 校验过；这里只保证是个对象，别把整棵设置写坏。
+      // activeAccountId 显式写 null 表示"放开指定"，必须原样存下来 ——
+      // 用真值判断会把 null 整个丢掉，rotationRule() 就会回落到全局的
+      // activeAccountId，用户点"自动挑"看着没反应。
       s.rotationRules = {};
       for (const [id, rule] of Object.entries(patch.rotationRules)) {
         if (!rule || typeof rule !== 'object') continue;
-        s.rotationRules[String(id)] = {
-          ...(rule.mode ? { mode: String(rule.mode) } : {}),
-          ...(rule.activeAccountId ? { activeAccountId: String(rule.activeAccountId) } : {}),
-        };
+        const next = {};
+        if (rule.mode) next.mode = String(rule.mode);
+        if ('activeAccountId' in rule) next.activeAccountId = rule.activeAccountId ? String(rule.activeAccountId) : null;
+        s.rotationRules[String(id)] = next;
       }
     }
     if (patch.modelTierOverrides && typeof patch.modelTierOverrides === 'object') {

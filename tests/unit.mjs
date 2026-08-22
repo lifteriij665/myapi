@@ -394,6 +394,19 @@ setRotationRule('freebuff', { mode: 'onerror', activeAccountId: 'f1' });
 eq('一出错就换：顺序和 exhaust 一样（区别在重试判定）', selectOrder(FREE).order.map((a) => a.id), ['f1', 'f2', 'f3']);
 eq('mode 透出给 engine', selectOrder(FREE).mode, 'onerror');
 
+// 「固定用哪个号」要能清空。显式写 null 是"用户说了放开指定"，
+// 和"从来没设过"是两件事 —— 后者才回落到全局 activeAccountId。
+store.data.settings.activeAccountId = 'f3';
+setRotationRule('freebuff', { activeAccountId: 'f1' });
+eq('指定了就用指定的', rotationRule('freebuff').activeAccountId, 'f1');
+setRotationRule('freebuff', { activeAccountId: null });
+eq('显式清空后不回落到全局值', rotationRule('freebuff').activeAccountId, null);
+eq('清空后落库的是 null 而不是被丢掉', Object.hasOwn(store.data.settings.rotationRules.freebuff, 'activeAccountId'), true);
+setRotationRule('opencode', { mode: 'exhaust' });
+eq('从没设过的上游才回落到全局 activeAccountId', rotationRule('opencode').activeAccountId, 'f3');
+store.data.settings.activeAccountId = null;
+setRotationRule('freebuff', { mode: 'exhaust', activeAccountId: 'f1' });
+
 // 每个上游互不干扰
 store.data.accounts.push(
   { id: 'o1', name: 'z1', token: 'sk-zen-aaaaaaaaaaaa', provider: 'opencode', pool: 'free', enabled: true, status: null },

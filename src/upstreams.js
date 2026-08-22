@@ -320,11 +320,13 @@ export function rotationRule(providerId) {
   const rules = store.data.settings?.rotationRules || {};
   const raw = rules[providerId];
   const mode = ROTATION_MODES.includes(raw?.mode) ? raw.mode : legacyMode();
+  // 这个上游有没有自己表过态？`activeAccountId: null` 是"用户明确说了放开指定"，
+  // 和"从来没设过"是两件事 —— 前者不该再回落到全局值，否则清空按钮点了没反应。
+  const declared = raw && Object.hasOwn(raw, 'activeAccountId');
   return {
     mode,
-    // 单号模式下用哪个号。没单独指定就回落到全局的"当前账号"，
-    // 这样从旧版本升上来的部署行为不变
-    activeAccountId: raw?.activeAccountId ?? store.data.settings?.activeAccountId ?? null,
+    // 从没设过时回落到全局的"当前账号"，这样从旧版本升上来的部署行为不变
+    activeAccountId: declared ? raw.activeAccountId : store.data.settings?.activeAccountId ?? null,
   };
 }
 
