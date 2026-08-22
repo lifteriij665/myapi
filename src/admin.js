@@ -201,11 +201,14 @@ async function liveModelIds() {
 /** SSE 推送用的轻量快照：不碰上游、不遍历磁盘（chatLogStatus 内部有 10 秒缓存） */
 function liveSnapshot() {
   const chat = chatLogStatus();
+  const activeId = store.settings.activeAccountId;
   return {
     at: nowIso(),
     usage: {
       totals: usage.data.totals,
-      today: usage.snapshot({ recentLimit: 0 }).today,
+      // 直接读今天那个桶。别用 usage.snapshot()：它会顺手算 48 小时 + 30 天序列
+      // 和四组 topBy 排序，而这里只要 today 一个字段 —— 这条路每 2 秒跑一次
+      today: usage.today(),
       windows: {
         m5: usage.windowStats(5 * 60_000),
         h1: usage.bucketWindow(1),
@@ -218,7 +221,7 @@ function liveSnapshot() {
       id: a.id,
       email: a.email || '',
       provider: providerOf(a),
-      active: store.settings.activeAccountId === a.id,
+      active: activeId === a.id,
       enabled: a.enabled !== false,
       state: a.status?.state || null,
       verdict: a.status?.verdict || null,
@@ -298,7 +301,7 @@ async function buildState(req) {
     },
     usageSummary: {
       totals: usage.data.totals,
-      today: usage.snapshot({ recentLimit: 0 }).today,
+      today: usage.today(),
       h1: usage.bucketWindow(1),
       eventsHeld: usage.events.length,
     },

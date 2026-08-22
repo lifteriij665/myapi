@@ -232,6 +232,11 @@ class Usage {
   }
 
   /** 控制台一次性要的全部数据 */
+  /** 今天那个桶。SSE 每 2 秒要一次，单独开个口子省掉整份 snapshot 的开销 */
+  today() {
+    return this.data.days[dayKey(Date.now())] || emptyBucket();
+  }
+
   snapshot({ recentLimit = 60 } = {}) {
     return {
       totals: this.data.totals,

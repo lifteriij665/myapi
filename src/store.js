@@ -199,7 +199,9 @@ class Store {
     if (!this._loaded) return;
     const tmp = `${config.dataFile}.tmp-${process.pid}`;
     try {
-      writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
+      // 不缩进：这个文件每次改动都要整份重写，400 个号时缩进白占 31% 的字节和
+      // 一半的序列化时间。要看内容用 jq / 控制台的「导出备份」都行
+      writeFileSync(tmp, JSON.stringify(this.data), { mode: 0o600 });
       renameSync(tmp, config.dataFile);
       try {
         chmodSync(config.dataFile, 0o600);

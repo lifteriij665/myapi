@@ -153,8 +153,13 @@ export function selectOrder(modelId) {
 /**
  * 记住这个上游"现在用哪个号"。每个上游各记一份（rotationRules[provider]），
  * 同时也更新全局的 activeAccountId 让老的控制台字段继续有意义。
+ *
+ * 只在真的换了号时才写：这个函数在**每次成功请求**后都会被调用，
+ * 而 setRotationRule → updateSettings 会把整个 rotationRules 对象重建一遍再触发落盘。
+ * 钉住同一个号跑一万次请求，本来会重建一万次。
  */
 function setActiveForProvider(provider, accountId) {
+  if (rotationRule(provider).activeAccountId === accountId) return;
   try {
     setRotationRule(provider, { activeAccountId: accountId });
   } catch {
@@ -772,8 +777,10 @@ async function dispatchApi(req, res, url) {
 
   const { acct: used, response } = hit;
   if (!used.anonymous) {
-    // 单号模式不该被请求悄悄改掉"当前账号"：那是用户手动钉的
-    if (mode !== 'single') setActiveForProvider(providerOf(used), used.id);
+    // 只有"钉住一个号"那两种策略才需要记指针：
+    //   single   是用户手动钉的，请求不该悄悄改掉
+    //   轮询/随机 每次都换起点，记指针没意义，写了还会跟游标打架
+    if (mode === 'exhaust' || mode === 'onerror') setActiveForProvider(providerOf(used), used.id);
     if (used.status && used.status.state !== 'ok' && response.status < 400) {
       store.setAccountStatus(used.id, { state: 'ok', verdict: '存活', detail: '刚刚成功承接了一次请求', quota: used.status.quota || '', source: 'request' });
     }
