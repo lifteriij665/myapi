@@ -177,6 +177,17 @@ $('#btn-logout').addEventListener('click', async () => {
 
 // ─────────────────────────────────────────────── 视图切换
 const VIEW_TITLE = { overview: '概览', usage: '用量', upstreams: '上游', accounts: '账号池', keys: 'API Key', models: '模型', settings: '设置' };
+// 每个视图配一句衬线斜体的副标题（那个 <em> 就是重音词）。
+// 大标题 + 斜体重音是这套设计语言里最省力的层次手段：一眼知道在哪、这页管什么。
+const VIEW_SUB = {
+  overview: ['这个网关现在', '什么状态'],
+  usage: ['请求、token、耗时都', '记在这'],
+  upstreams: ['每个上游一套', '换号策略'],
+  accounts: ['所有上游的凭据', '都在这一张表'],
+  keys: ['发给客户端的', '凭证'],
+  models: ['所有上游的模型', '合成一张表'],
+  settings: ['默认行为、留存和', '清理'],
+};
 
 /** 数字/字节/时长的统一格式化 —— 表格里全是等宽数字，别让单位到处不一样 */
 const fmtInt = (n) => Number(n || 0).toLocaleString('zh-CN');
@@ -201,11 +212,33 @@ const fmtMs = (n) => {
 };
 const clock = (iso) => new Date(iso).toLocaleTimeString('zh-CN', { hour12: false });
 
+/**
+ * 给某个视图的顶层块重放一次入场动画（依次浮上来，错峰 0/60/120/180ms）。
+ * 做法是先摘掉 .anim 再强制 reflow 再加回去 —— 不然同一个元素第二次进来时
+ * 浏览器认为动画没变，不会重播。
+ */
+function replayReveal(view) {
+  const root = $(`.view[data-view="${view}"]`);
+  if (!root) return;
+  const blocks = [...root.children].slice(0, 8);
+  blocks.forEach((el, i) => {
+    el.classList.remove('anim', 'd1', 'd2', 'd3', 'd4');
+    void el.offsetWidth; // 强制 reflow，让下一行的 class 被当成新动画
+    el.classList.add('anim', `d${Math.min(4, i + 1)}`);
+  });
+}
+
 function show(view) {
   VIEW = view;
   $$('.nav-item').forEach((b) => b.classList.toggle('is-active', b.dataset.view === view));
   $$('.view').forEach((s) => s.classList.toggle('hidden', s.dataset.view !== view));
   $('#view-title').textContent = VIEW_TITLE[view] || view;
+  const sub = VIEW_SUB[view];
+  // textContent 装不了 <em>，但这两段是代码里的常量、不是用户输入，用 innerHTML 安全
+  $('#view-sub').innerHTML = sub ? `${esc(sub[0])} <em>${esc(sub[1])}</em>` : '';
+  // 入场错峰：进这个视图时，它的顶层块依次浮上来。
+  // 只在**切换视图**时放，20 秒的后台刷新不重放 —— 否则页面每 20 秒抖一下。
+  replayReveal(view);
   if (location.hash.slice(1) !== view) history.replaceState(null, '', `#${view}`);
   window.scrollTo({ top: 0 });
   if (view === 'usage') loadUsage();

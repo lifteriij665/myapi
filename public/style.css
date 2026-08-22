@@ -1,12 +1,18 @@
 /* ═══════════════════════════════════════════════════════════════
-   myapi 控制台 —— 配电盘（patch bay）风格：深青黑底 + 等宽字排版
+   myapi 控制台
    语义色只有两个：signal(免费/健康) 和 meter(付费/要烧额度)
 
-   排版取向（照着几份现代 landing page 的做法收敛过来的）：
-     * 一个强调色就够，其余全靠灰阶分层 —— 不堆渐变、不堆装饰块
-     * 标题用衬线体做一个"重音"，正文仍是无衬线，对比出层次
-     * 竖向留白给足：区块之间用空间分组，而不是靠画更多边框
-     * 边框只做最轻的分隔，重的活交给背景色差
+   从几份现代 landing page 里抽出来的共通做法，落到这个后台上：
+     1. 药丸几何 —— 状态标记、分段控件、主按钮一律 999px 全圆角，
+        方角只留给「容器」（面板、表格）。圆的是可点的，方的是装东西的。
+     2. 衬线斜体重音 —— 标题里挑一个词用衬线斜体，是这套语言最省力的层次手段
+        （Neuralyn 的 "Overview"、Palomar 的编辑感都靠这个）。
+     3. 入场动画 + 错峰 —— 每个视图的元素按 0/60/120/180ms 依次淡入上移，
+        cubic-bezier(0.22, 1, 0.36, 1) 那条曲线。不是装饰，是让人看清"先看哪"。
+     4. 玻璃表面 —— 悬浮层（顶栏、弹窗、药丸）用 blur + 内高光描边，
+        而不是实心色块。inset 0 1px 1px rgba(255,255,255,.08) 是关键那一笔。
+     5. 大字号显示层级 —— 页标题敢用 30px+ 衬线，其余全压到 13px 以下。
+        对比要拉开，不要五档字号都差 1px。
    ═══════════════════════════════════════════════════════════════ */
 :root {
   --ink: #0b1113;
@@ -31,6 +37,27 @@
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Songti SC", "Source Han Serif SC", "Noto Serif CJK SC", serif;
   --rail: 216px;
   --r: 10px;
+  /* 药丸：可点击的东西一律用它 */
+  --pill: 999px;
+  /* 那条入场/悬停曲线，整站统一 */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  /* 玻璃面的内高光，悬浮层专用 */
+  --glass-edge: inset 0 1px 1px rgba(255, 255, 255, 0.08);
+}
+
+/* ── 入场动画：视图切换时元素依次浮上来，错峰用 --d ── */
+@keyframes reveal {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.anim { animation: reveal 0.5s var(--ease) both; animation-delay: var(--d, 0ms); }
+.d1 { --d: 0ms; }
+.d2 { --d: 60ms; }
+.d3 { --d: 120ms; }
+.d4 { --d: 180ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  .anim { animation: none; }
 }
 
 * { box-sizing: border-box; }
@@ -114,15 +141,31 @@ a:hover { text-decoration: underline; }
   backdrop-filter: blur(4px);
 }
 /* 页标题：衬线体 + 大一号，给每个视图一个明确的开场。
-   这是整页唯一的"大字"，其余都收在 13px 以下 —— 层次靠这一处对比拉开 */
+   这是整页唯一的"大字"，其余都收在 13px 以下 —— 层次靠这一处对比拉开。
+   标题里那个 <em> 是衬线斜体的重音词，这套设计语言最省力的层次手段。 */
 .topbar h1 {
   font-family: var(--serif);
-  font-size: 25px;
-  line-height: 1.15;
+  font-size: 30px;
+  line-height: 1.1;
   margin: 0;
-  letter-spacing: -0.015em;
+  letter-spacing: -0.02em;
   font-weight: 400;
 }
+.topbar h1 em {
+  font-style: italic;
+  /* 重音词稍微亮一点，但不换颜色 —— 换颜色就变成"两个强调色"了 */
+  color: #f2f7f8;
+}
+.topbar-title { display: flex; flex-direction: column; gap: 1px; flex: none; }
+.topbar-sub {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 13px;
+  line-height: 1.3;
+  color: var(--muted-2);
+  letter-spacing: -0.005em;
+}
+.topbar-sub em { font-style: italic; color: var(--muted); }
 .synced { font-family: var(--mono); font-size: 10.5px; color: var(--muted-2); }
 
 .pill {
@@ -134,10 +177,13 @@ a:hover { text-decoration: underline; }
   font-family: var(--mono);
   font-size: 11px;
   color: var(--muted);
-  border: 1px solid var(--edge);
-  background: var(--panel);
-  border-radius: 20px;
-  padding: 3px 10px 3px 8px;
+  /* 玻璃面：半透明 + 模糊 + 内高光描边，而不是实心色块 */
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(6px);
+  box-shadow: var(--glass-edge);
+  border-radius: var(--pill);
+  padding: 4px 12px 4px 10px;
 }
 .lamp {
   width: 7px;
@@ -326,12 +372,13 @@ a:hover { text-decoration: underline; }
 .rot-seg button {
   font: inherit;
   font-size: 11.5px;
-  padding: 4px 9px;
+  padding: 4px 12px;
   color: var(--muted);
   background: var(--ink-2);
   border: 1px solid var(--edge);
-  border-radius: 6px;
+  border-radius: var(--pill);
   cursor: pointer;
+  transition: color 0.16s var(--ease), background 0.16s var(--ease), border-color 0.16s var(--ease);
 }
 .rot-seg button:hover { color: var(--text); border-color: var(--edge-2); }
 .rot-seg button.is-on {
@@ -574,32 +621,39 @@ a:hover { text-decoration: underline; }
 .mrow b { color: var(--muted); font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── 控件：按钮 ── */
+/* 按钮：全圆角药丸。可点的东西是圆的，装东西的容器才是方的 */
 .btn {
   font: inherit;
   font-size: 12.5px;
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--edge-2);
-  border-radius: 8px;
-  padding: 7px 13px;
+  border-radius: var(--pill);
+  padding: 7px 15px;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.14s, border-color 0.14s, color 0.14s;
+  transition: background 0.16s var(--ease), border-color 0.16s var(--ease), color 0.16s var(--ease), transform 0.16s var(--ease);
 }
-.btn:hover:not(:disabled) { background: #1b272d; border-color: #35494f; }
-.btn:active:not(:disabled) { transform: translateY(0.5px); }
+.btn:hover:not(:disabled) { background: #1b272d; border-color: #35494f; transform: translateY(-1px); }
+.btn:active:not(:disabled) { transform: translateY(0); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn.primary {
   background: var(--signal);
   border-color: var(--signal);
   color: #06231a;
   font-weight: 600;
+  /* 主按钮带一层柔光，是这套语言里唯一的"发光" */
+  box-shadow: 0 0 0 1px rgba(79, 211, 154, 0.18), 0 0 18px rgba(79, 211, 154, 0.16);
 }
-.btn.primary:hover:not(:disabled) { background: #63e5ac; border-color: #63e5ac; }
+.btn.primary:hover:not(:disabled) {
+  background: #63e5ac;
+  border-color: #63e5ac;
+  box-shadow: 0 0 0 1px rgba(79, 211, 154, 0.28), 0 0 26px rgba(79, 211, 154, 0.26);
+}
 .btn.quiet { background: none; border-color: transparent; color: var(--muted); }
 .btn.quiet:hover:not(:disabled) { background: var(--panel); color: var(--text); border-color: var(--edge); }
-.btn.tiny { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
-.btn.danger { color: var(--alarm); border-color: var(--alarm-dim); background: none; }
+.btn.tiny { padding: 3px 10px; font-size: 11px; }
+.btn.danger { color: var(--alarm); border-color: var(--alarm-dim); background: none; box-shadow: none; }
 .btn.danger:hover:not(:disabled) { background: rgba(239, 112, 112, 0.09); border-color: #5d2c30; }
 .btn.block { width: 100%; }
 
@@ -668,16 +722,17 @@ select.inline { width: auto; padding: 3px 24px 3px 8px; font-size: 11.5px; font-
 .row-toggle span { flex: 1; }
 
 /* ── 分段选择 ── */
-.seg { display: inline-flex; background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 2px; gap: 2px; }
+.seg { display: inline-flex; background: var(--panel); border: 1px solid var(--edge); border-radius: var(--pill); padding: 3px; gap: 2px; }
 .seg button {
   font: inherit;
   font-size: 12px;
   color: var(--muted);
   background: none;
   border: 0;
-  padding: 4px 11px;
-  border-radius: 6px;
+  padding: 4px 13px;
+  border-radius: var(--pill);
   cursor: pointer;
+  transition: color 0.16s var(--ease), background 0.16s var(--ease);
 }
 .seg button.is-on { background: var(--panel-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--edge-2); }
 .seg button:hover:not(.is-on) { color: var(--text); }
@@ -689,8 +744,8 @@ select.inline { width: auto; padding: 3px 24px 3px 8px; font-size: 11.5px; font-
   gap: 5px;
   font-family: var(--mono);
   font-size: 10.5px;
-  padding: 2px 7px;
-  border-radius: 5px;
+  padding: 2px 9px;
+  border-radius: var(--pill);
   border: 1px solid var(--edge-2);
   color: var(--muted);
   white-space: nowrap;
@@ -775,7 +830,15 @@ dialog {
   max-height: 92vh;
   box-shadow: 0 50px 100px -40px #000;
 }
-dialog::backdrop { background: rgba(4, 8, 9, 0.72); backdrop-filter: blur(3px); }
+dialog::backdrop { background: rgba(4, 8, 9, 0.74); backdrop-filter: blur(6px); }
+dialog[open] { animation: dlgIn 0.28s var(--ease) both; }
+@keyframes dlgIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  dialog[open] { animation: none; }
+}
 .dlg-head {
   display: flex;
   align-items: center;
