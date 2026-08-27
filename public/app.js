@@ -742,6 +742,8 @@ function openUpstreamForm(existing = null) {
       d.close();
       sync();
     } catch (err) {
+      // 原因留在弹窗里：只发 toast 的话 4 秒就没了，用户以为"点了没反应"
+      d.fail(err.message);
       toast(err.message, 'err', 8000);
       btn.disabled = false;
     }
@@ -774,6 +776,8 @@ function openAddKeys(u) {
       d.close();
       sync();
     } catch (err) {
+      // 原因留在弹窗里：toast 4 秒就没了，用户会以为"点了没反应"
+      d.fail(err.message);
       toast(err.message, 'err');
       btn.disabled = false;
     }
@@ -815,6 +819,8 @@ function openAddModels(u) {
       d.close();
       sync();
     } catch (err) {
+      // 原因留在弹窗里：toast 4 秒就没了，用户会以为"点了没反应"
+      d.fail(err.message);
       toast(err.message, 'err');
       btn.disabled = false;
     }
@@ -1476,7 +1482,7 @@ function openDialog(title, html, { width = 560, onClose } = {}) {
   dlg.style.setProperty('--dlg-w', `${width}px`);
   dlg.innerHTML = `<div class="dlg-head"><b>${esc(title)}</b><span class="grow"></span>
     <button class="btn quiet tiny js-x" type="button">关闭</button></div>
-    <div class="dlg-body">${html}</div>`;
+    <div class="dlg-body">${html}<div class="dlg-err hidden"></div></div>`;
   $('#dialogs').appendChild(dlg);
   dialogDepth++;
   dlg.addEventListener('close', () => {
@@ -1488,7 +1494,18 @@ function openDialog(title, html, { width = 560, onClose } = {}) {
   dlg.showModal();
   // 首个可输入元素自动聚焦，省一次点击
   setTimeout(() => $('input:not([readonly]), textarea, select', dlg)?.focus(), 60);
-  return { root: dlg, close: () => dlg.close() };
+  /**
+   * 提交失败时把原因**留在弹窗里**，不能只靠 toast —— toast 4 秒就没了，
+   * 用户看到的就是"点了没反应，录不进去"。这一条是从真实反馈里改出来的。
+   */
+  const fail = (msg) => {
+    const box = $('.dlg-err', dlg);
+    box.textContent = String(msg || '出错了');
+    box.classList.remove('hidden');
+    box.scrollIntoView({ block: 'nearest' });
+  };
+  const clearFail = () => $('.dlg-err', dlg).classList.add('hidden');
+  return { root: dlg, close: () => dlg.close(), fail, clearFail };
 }
 
 $('#btn-add-key').addEventListener('click', () => {
@@ -2084,6 +2101,7 @@ function openOpencodeAdd() {
       d.close();
       sync();
     } catch (err) {
+      d.fail(err.message);
       toast(err.message, 'err', 8000);
       btn.disabled = false;
     }

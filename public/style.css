@@ -848,6 +848,18 @@ dialog[open] { animation: dlgIn 0.28s var(--ease) both; }
 }
 .dlg-head b { font-size: 14px; font-weight: 600; }
 .dlg-body { padding: 16px; overflow: auto; max-height: calc(92vh - 56px); }
+/* 提交失败时留在弹窗里的那条原因。toast 会消失，这个不会 —— 用户能一直看着它改 */
+.dlg-err {
+  margin-top: 14px;
+  padding: 10px 13px;
+  border-radius: var(--r);
+  border: 1px solid var(--alarm-dim);
+  background: rgba(239, 112, 112, 0.07);
+  color: #ffc9c9;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
 .dlg-foot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 
 /* ── 添加账号：方式选择 ── */
