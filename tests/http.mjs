@@ -85,6 +85,15 @@ const called = await raw('/v1/chat/completions', {
 const text = await called.text();
 check('上游失败的错误里不含账号邮箱', !text.includes('sec@t.com'), text.slice(0, 200));
 check('试过的账号数只给数量', /^\d+$/.test(called.headers.get('x-myapi-accounts-tried') || ''), called.headers.get('x-myapi-accounts-tried'));
+// 随包引擎有一份本地硬编码的暂停名单，命中时它只回一句干巴巴的 unsupported_model。
+// 我们不改 vendor 文件，但要把这句话翻译清楚 —— 说明是引擎本地拒的，不是上游拒的。
+if (/unsupported_model/.test(text)) {
+  check(
+    '引擎本地拒模型时说清是本地拒的、给了下一步',
+    /vendor\/worker\.js/.test(text) && /update-worker/.test(text) && /不是上游拒的/.test(text),
+    text.slice(0, 200)
+  );
+}
 
 // ── 跨站写请求 ──
 const csrf = await admin('/keys', 'POST', { name: 'x' }, { origin: 'https://evil.example' });

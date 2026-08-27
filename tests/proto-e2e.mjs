@@ -213,7 +213,7 @@ const singleResp = await fetch(`${BASE}/v1/chat/completions`, {
 });
 await singleResp.text();
 check('单号策略：响应头标出 single', singleResp.headers.get('x-myapi-rotation') === 'single', singleResp.headers.get('x-myapi-rotation'));
-check('单号策略：只试了一个号', singleResp.headers.get('x-myapi-accounts-tried') === null || singleResp.headers.get('x-myapi-accounts-tried') === '0', singleResp.headers.get('x-myapi-accounts-tried'));
+check('单号策略：只试了一个号', singleResp.headers.get('x-myapi-accounts-tried') === '1', singleResp.headers.get('x-myapi-accounts-tried'));
 
 // 一个坏 key 的上游：onerror 会一路换号，最后给出明确失败。
 // 注意 tokenMasked 对这几个 key 是一样的（中间都被打码了），没法靠它区分，

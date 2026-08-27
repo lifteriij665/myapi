@@ -710,8 +710,12 @@ async function dispatchApi(req, res, url) {
   let hit = null; // { acct, response }
   let last = null; // { status, text, acct, state }
   const tried = [];
+  // 真正发出去了几次。tried 只记失败，所以成功/客户端错误那一次不在里面 ——
+  // 但 x-myapi-accounts-tried 要的是"这次用了几个号"，得单独数
+  let attempts = 0;
   for (const acct of order) {
     let resp;
+    attempts++;
     try {
       resp = await callUpstream(acct);
     } catch (err) {
@@ -769,7 +773,7 @@ async function dispatchApi(req, res, url) {
       error: last ? `${last.state}: HTTP ${last.status}` : 'no_account',
     });
     send(res, status, errorBody(pathname, `上游调用失败（${reason}）${suffix}，详情见控制台的账号状态`, status), {
-      'x-myapi-accounts-tried': String(tried.length),
+      'x-myapi-accounts-tried': String(attempts),
       ...(status === 429 ? { 'retry-after': '60' } : {}),
     });
     return;
@@ -794,7 +798,7 @@ async function dispatchApi(req, res, url) {
   }
   headers['x-myapi-rotation'] = used.anonymous ? 'anonymous' : mode;
   headers['x-myapi-provider'] = providerOf(used);
-  if (tried.length) headers['x-myapi-accounts-tried'] = String(tried.length);
+  if (attempts) headers['x-myapi-accounts-tried'] = String(attempts);
   if (requestedModel) headers['x-myapi-model-tier'] = tierOf(requestedModel);
   if (isAnthropic) headers['request-id'] = `req_${randomId(12)}`;
 
@@ -810,6 +814,18 @@ async function dispatchApi(req, res, url) {
       payload = JSON.parse(text);
     } catch {}
     const ok = response.status < 400;
+    // 随包引擎自己有一份硬编码的"暂停名单"（vendor/worker.js 的 PAUSED_MODELS），
+    // 命中就回一句干巴巴的 `unsupported_model`。那是**引擎本地**在拒，不是真上游 ——
+    // 我们不改 vendor 文件，但至少把这句话翻译清楚，别让用户对着它猜。
+    if (!ok && payload?.error?.type === 'unsupported_model' && providerOf(used) === 'freebuff' && isKnownModel(requestedModel)) {
+      payload = errorBody(
+        pathname,
+        `随包引擎 vendor/worker.js 在本地把 ${requestedModel} 列进了暂停名单，所以这一步没发到上游（不是上游拒的）。` +
+          `跑 npm run update-worker 升级引擎可能就恢复了；也可以先换一个模型。`,
+        response.status,
+        'unsupported_model'
+      );
+    }
     // 自定义上游 / opencode 的非 chat 原生模型，先归一到中枢格式：后面的 usage
     // 统计、聊天记录、协议回翻全都按 chat 的字段读，翻早一点这些就都不用再分情况
     if (payload && ok && customUp && providerOf(used) === customUp.id) {
